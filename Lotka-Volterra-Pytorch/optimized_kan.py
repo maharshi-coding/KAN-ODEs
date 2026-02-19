@@ -408,11 +408,11 @@ class DataNormalizer:
     def fit_input(self, data):
         """Fit normalizer to input data."""
         if isinstance(data, torch.Tensor):
-            self.input_min = data.min(dim=0, keepdim=True)[0]
-            self.input_max = data.max(dim=0, keepdim=True)[0]
+            self.input_min = data.min(dim=0, keepdim=True)[0].float()
+            self.input_max = data.max(dim=0, keepdim=True)[0].float()
         else:
-            self.input_min = torch.tensor(np.min(data, axis=0, keepdims=True))
-            self.input_max = torch.tensor(np.max(data, axis=0, keepdims=True))
+            self.input_min = torch.tensor(np.min(data, axis=0, keepdims=True), dtype=torch.float32)
+            self.input_max = torch.tensor(np.max(data, axis=0, keepdims=True), dtype=torch.float32)
         # Avoid division by zero
         self.input_max = torch.where(
             self.input_max == self.input_min, 
@@ -423,11 +423,11 @@ class DataNormalizer:
     def fit_output(self, data):
         """Fit normalizer to output data."""
         if isinstance(data, torch.Tensor):
-            self.output_min = data.min(dim=0, keepdim=True)[0]
-            self.output_max = data.max(dim=0, keepdim=True)[0]
+            self.output_min = data.min(dim=0, keepdim=True)[0].float()
+            self.output_max = data.max(dim=0, keepdim=True)[0].float()
         else:
-            self.output_min = torch.tensor(np.min(data, axis=0, keepdims=True))
-            self.output_max = torch.tensor(np.max(data, axis=0, keepdims=True))
+            self.output_min = torch.tensor(np.min(data, axis=0, keepdims=True), dtype=torch.float32)
+            self.output_max = torch.tensor(np.max(data, axis=0, keepdims=True), dtype=torch.float32)
         # Avoid division by zero
         self.output_max = torch.where(
             self.output_max == self.output_min, 
