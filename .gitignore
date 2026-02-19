@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+plots/optimized_kan/
+plots/baseline_kan/
+results/*.json
+*.ckpt
+*.pth
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data
+*.csv
+*.h5
+*.hdf5
