@@ -84,9 +84,11 @@ Base.@kwdef struct TrainParams
     finetune_epochs::Int = 300
     n_interior_uniform::Int = 96
     n_interior_refine::Int = 96
+    n_interior_tip_strip::Int = 128
     n_boundary_each::Int = 48
     val_n_interior_uniform::Int = 192
     val_n_interior_refine::Int = 192
+    val_n_interior_tip_strip::Int = 256
     val_n_boundary_each::Int = 96
     λ_bc::Float32 = 20.0f0
     λ_gauge::Float32 = 1.0f-3
@@ -99,6 +101,8 @@ Base.@kwdef struct TrainParams
     min_improve::Float32 = 1.0f-4
     max_grad_norm::Float32 = 10.0f0
     checkpoint_every::Int = 100
+    tip_strip_half_height::Float32 = 0.035f0
+    tip_strip_length::Float32 = 0.20f0
     seed::Int = 42
 end
 
@@ -187,7 +191,14 @@ function sample_points_excluding_notch(geo::GeometryParams, n::Int; xlo::Float32
     return pts
 end
 
-function sample_interior(geo::GeometryParams, n_uniform::Int, n_refine::Int)
+function sample_interior(
+    geo::GeometryParams,
+    n_uniform::Int,
+    n_refine::Int,
+    n_tip_strip::Int,
+    tip_strip_half_height::Float32,
+    tip_strip_length::Float32,
+)
     uniform_pts = sample_points_excluding_notch(geo, n_uniform)
     x0, y0 = geo.tip
     hr = geo.refine_half_width
@@ -200,7 +211,16 @@ function sample_interior(geo::GeometryParams, n_uniform::Int, n_refine::Int)
         yhi=min(geo.ymax, y0 + hr),
     )
 
-    return vcat(uniform_pts, refine_pts)
+    tip_strip_pts = sample_points_excluding_notch(
+        geo,
+        n_tip_strip;
+        xlo=max(geo.xmin, x0 - tip_strip_length),
+        xhi=min(geo.xmax, x0),
+        ylo=max(geo.ymin, y0 - tip_strip_half_height),
+        yhi=min(geo.ymax, y0 + tip_strip_half_height),
+    )
+
+    return vcat(uniform_pts, refine_pts, tip_strip_pts)
 end
 
 function notch_face_points(geo::GeometryParams, n::Int)
@@ -274,7 +294,7 @@ function pde_loss(model, interior_pts::Matrix{Float32}, mat::MaterialParams, geo
 end
 
 function boundary_loss(model, bdata, bc::BCParams)
-    labels = (:Γ1, :Γ2, :Γ3, :Γ4, :Γ5a, :Γ5b)
+    labels = (:Γ1, :Γ2, :Γ3, :Γ4)
     total = 0f0
     count = 0
 
@@ -291,6 +311,99 @@ function boundary_loss(model, bdata, bc::BCParams)
     end
 
     return total / max(count, 1)
+end
+
+function residual_statistics(model, mat::MaterialParams, geo::GeometryParams, trn::TrainParams; n::Int = 512)
+    pts = sample_points_excluding_notch(geo, n)
+    residuals = Float32[]
+    for i in 1:size(pts, 1)
+        x = pts[i, 1]
+        y = pts[i, 2]
+        r = divergence_flux_fd(model, x, y, mat, geo, trn.fd_eps)
+        push!(residuals, r)
+    end
+
+    abs_res = abs.(residuals)
+    rms = sqrt(mean(residuals .^ 2))
+    return (
+        mean_abs = mean(abs_res),
+        max_abs = maximum(abs_res),
+        rms = rms,
+    )
+end
+
+function symmetry_error(model, geo::GeometryParams; n::Int = 512)
+    x0, y0 = geo.tip
+    _ = x0
+    pts = sample_points_excluding_notch(geo, n; ylo=y0, yhi=geo.ymax)
+    errs = Float32[]
+
+    for i in 1:size(pts, 1)
+        x = pts[i, 1]
+        y = pts[i, 2]
+        ym = Float32(2f0 * y0 - y)
+        if ym >= geo.ymin && ym <= geo.ymax && !point_in_notch_void(x, ym, geo)
+            ϕ1 = phi_scalar(model, x, y)
+            ϕ2 = phi_scalar(model, x, ym)
+            push!(errs, abs(ϕ1 - ϕ2))
+        end
+    end
+
+    if isempty(errs)
+        return (mean_abs = NaN32, max_abs = NaN32, n_pairs = 0)
+    end
+
+    return (mean_abs = mean(errs), max_abs = maximum(errs), n_pairs = length(errs))
+end
+
+function tip_gradient_indicator(model, geo::GeometryParams, trn::TrainParams)
+    x0, y0 = geo.tip
+    xnear = collect(range(max(geo.xmin, x0 - 0.06f0), x0 - 0.005f0; length=80))
+    xfar = collect(range(geo.xmin, max(geo.xmin, x0 - 0.20f0); length=80))
+    ynear = fill(y0, length(xnear))
+    yfar = fill(y0, length(xfar))
+
+    gnear = gradmag_on_line(model, xnear, ynear, geo; h=trn.fd_eps)
+    gfar = gradmag_on_line(model, xfar, yfar, geo; h=trn.fd_eps)
+    near_mean = mean(gnear)
+    far_mean = mean(gfar)
+    ratio = near_mean / (far_mean + 1f-8)
+
+    return (near_mean = near_mean, far_mean = far_mean, ratio = ratio)
+end
+
+function grid_finite_check(model, geo::GeometryParams; nx::Int = 121, ny::Int = 121)
+    xs, ys, Φ = field_on_grid(model, geo; nx=nx, ny=ny)
+    bad_outside = 0
+    outside_total = 0
+
+    for (iy, y) in pairs(ys), (ix, x) in pairs(xs)
+        inside_void = point_in_notch_void(Float32(x), Float32(y), geo)
+        v = Φ[iy, ix]
+        if !inside_void
+            outside_total += 1
+            if isnan(v) || !isfinite(v)
+                bad_outside += 1
+            end
+        end
+    end
+
+    return (outside_total = outside_total, bad_outside = bad_outside)
+end
+
+function run_cross_verification(model, mat::MaterialParams, geo::GeometryParams, trn::TrainParams)
+    rstats = residual_statistics(model, mat, geo, trn)
+    sstats = symmetry_error(model, geo)
+    tipstats = tip_gradient_indicator(model, geo, trn)
+    gstats = grid_finite_check(model, geo)
+
+    println("Cross verification summary:")
+    @printf("  PDE residual  | mean|r|=%.5e, rms=%.5e, max|r|=%.5e\n", rstats.mean_abs, rstats.rms, rstats.max_abs)
+    @printf("  Symmetry      | mean|ΔΦ|=%.5e, max|ΔΦ|=%.5e (pairs=%d)\n", sstats.mean_abs, sstats.max_abs, sstats.n_pairs)
+    @printf("  Tip gradient  | near=%.5e, far=%.5e, near/far=%.3f\n", tipstats.near_mean, tipstats.far_mean, tipstats.ratio)
+    @printf("  Finite check  | bad outside notch=%d / %d\n", gstats.bad_outside, gstats.outside_total)
+
+    return (residual=rstats, symmetry=sstats, tip=tipstats, finite=gstats)
 end
 
 function gauge_loss(model)
@@ -376,7 +489,14 @@ function train_stage!(
     for stage_step in 1:epochs
         epoch = start_epoch + stage_step - 1
 
-        interior = sample_interior(geo, trn.n_interior_uniform, trn.n_interior_refine)
+        interior = sample_interior(
+            geo,
+            trn.n_interior_uniform,
+            trn.n_interior_refine,
+            trn.n_interior_tip_strip,
+            trn.tip_strip_half_height,
+            trn.tip_strip_length,
+        )
         bdata = sample_boundaries(geo, trn.n_boundary_each)
 
         function loss_fn(θvec)
@@ -453,7 +573,14 @@ function train!(θ, re, mat, geo, bc, trn; outdir::String, resume::Bool = false)
     pde_hist = Float32[]
     bc_hist = Float32[]
     val_hist = Float32[]
-    val_interior = sample_interior(geo, trn.val_n_interior_uniform, trn.val_n_interior_refine)
+    val_interior = sample_interior(
+        geo,
+        trn.val_n_interior_uniform,
+        trn.val_n_interior_refine,
+        trn.val_n_interior_tip_strip,
+        trn.tip_strip_half_height,
+        trn.tip_strip_length,
+    )
     val_bdata = sample_boundaries(geo, trn.val_n_boundary_each)
     best_θ = copy(θ)
     best_val = Float32(Inf)
@@ -634,9 +761,11 @@ function main()
         finetune_epochs=parse(Int, get(ENV, "KAN_PINN_FINETUNE_EPOCHS", "300")),
         n_interior_uniform=parse(Int, get(ENV, "KAN_PINN_NU", "96")),
         n_interior_refine=parse(Int, get(ENV, "KAN_PINN_NR", "96")),
+        n_interior_tip_strip=parse(Int, get(ENV, "KAN_PINN_NTIP", "128")),
         n_boundary_each=parse(Int, get(ENV, "KAN_PINN_NB", "48")),
         val_n_interior_uniform=parse(Int, get(ENV, "KAN_PINN_VAL_NU", "192")),
         val_n_interior_refine=parse(Int, get(ENV, "KAN_PINN_VAL_NR", "192")),
+        val_n_interior_tip_strip=parse(Int, get(ENV, "KAN_PINN_VAL_NTIP", "256")),
         val_n_boundary_each=parse(Int, get(ENV, "KAN_PINN_VAL_NB", "96")),
         learning_rate=parse(Float32, get(ENV, "KAN_PINN_LR", "1.0e-3")),
         finetune_lr=parse(Float32, get(ENV, "KAN_PINN_FINETUNE_LR", "2.0e-4")),
@@ -647,12 +776,14 @@ function main()
         min_improve=parse(Float32, get(ENV, "KAN_PINN_MIN_IMPROVE", "1.0e-4")),
         max_grad_norm=parse(Float32, get(ENV, "KAN_PINN_MAX_GRAD_NORM", "10.0")),
         checkpoint_every=parse(Int, get(ENV, "KAN_PINN_CKPT_EVERY", "100")),
+        tip_strip_half_height=parse(Float32, get(ENV, "KAN_PINN_TIP_STRIP_HH", "0.035")),
+        tip_strip_length=parse(Float32, get(ENV, "KAN_PINN_TIP_STRIP_LEN", "0.20")),
         seed=parse(Int, get(ENV, "KAN_PINN_SEED", "42")),
     )
     resume_training = lowercase(get(ENV, "KAN_PINN_RESUME", "0")) in ("1", "true", "yes", "y")
     run_name = strip(get(ENV, "KAN_PINN_RUN_NAME", ""))
 
-    println("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ5).")
+    println("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ4; natural on Γ5a/Γ5b).")
 
     Random.seed!(trn.seed)
 
@@ -667,6 +798,7 @@ function main()
     best_θ, lhist, lpde_hist, lbc_hist, val_hist = train!(θ, re, mat, geo, bc, trn; outdir=outdir, resume=resume_training)
     model = re(best_θ)
 
+    run_cross_verification(model, mat, geo, trn)
     save_plots(model, lhist, lpde_hist, lbc_hist, val_hist, geo; outdir=outdir)
     println("Training complete. Outputs saved in: ", outdir)
 end
