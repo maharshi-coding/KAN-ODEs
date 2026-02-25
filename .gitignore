@@ -41,3 +41,12 @@ results/*.json
 *.csv
 *.h5
 *.hdf5
+
+PDE examples/.venv/
+
+PDE examples/results_strainlimiting/
+
+PDE examples/results_strainlimiting_python/
+
+PDE examples/train_log.txt
+
