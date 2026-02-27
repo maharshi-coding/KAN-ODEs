@@ -77,14 +77,14 @@ class BCParams:
 
 @dataclass
 class TrainParams:
-    adam_epochs: int = 6000
-    finetune_epochs: int = 4000
+    adam_epochs: int = 4000
+    finetune_epochs: int = 6000
     pretrain_epochs: int = 1000
     pde_ramp_epochs: int = 2000
 
     n_interior_uniform: int = 64
     n_interior_refine: int = 128
-    n_interior_tip_strip: int = 4096
+    n_interior_tip_strip: int = 5000
     n_boundary_each: int = 48
 
     val_n_interior_uniform: int = 192
@@ -95,8 +95,13 @@ class TrainParams:
     lambda_bc: float = 300.0
     lambda_gauge: float = 1e-3
     lambda_sym: float = 10.0
+    lambda_pde: float = 10.0
+    lambda_tip: float = 1.0
 
-    learning_rate: float = 1e-3
+    tip_stress_c: float = 1.0
+    tip_stress_eps: float = 1e-5
+
+    learning_rate: float = 1e-4
     finetune_lr: float = 1e-4
 
     print_every: int = 50
@@ -104,7 +109,11 @@ class TrainParams:
     checkpoint_every: int = 25
     early_stop_patience: int = 300
     min_improve: float = 1e-4
-    max_grad_norm: float = 5.0
+    max_grad_norm: float = 1.0
+
+    # Best-model selection (physics-aware)
+    model_select_start_epoch: int = 1001
+    model_select_pde_weight_floor: float = 1.0
 
     # Singular weighting w=1/(dist_to_tip+eps)
     tip_weight_eps: float = 2e-3
@@ -118,8 +127,14 @@ class TrainParams:
     lr_gamma_finetune: float = 0.9999
 
     # Memory control
-    train_pde_chunk_size: int = 32
-    val_pde_chunk_size: int = 32
+    train_pde_chunk_size: int = 256
+    val_pde_chunk_size: int = 256
+
+    # Adaptive residual sampling
+    adaptive_sampling: bool = False
+    adaptive_candidates: int = 4096
+    adaptive_topk: int = 512
+    adaptive_start_epoch: int = 200
 
     # Reproducibility
     seed: int = 42
@@ -244,14 +259,7 @@ def sample_interior_points(geo: GeometryParams, trn: TrainParams) -> np.ndarray:
         yhi=min(geo.ymax, y0 + hr),
     )
 
-    tip_pts = sample_points_excluding_notch(
-        geo,
-        trn.n_interior_tip_strip,
-        xlo=max(geo.xmin, x0 - trn.tip_strip_length),
-        xhi=min(geo.xmax, x0),
-        ylo=max(geo.ymin, y0 - trn.tip_strip_half_height),
-        yhi=min(geo.ymax, y0 + trn.tip_strip_half_height),
-    )
+    tip_pts = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
 
     return np.vstack([uniform_pts, refine_pts, tip_pts]).astype(np.float32)
 
@@ -268,6 +276,81 @@ def sample_interior_points_val(geo: GeometryParams, trn: TrainParams) -> np.ndar
     pts = sample_interior_points(geo, trn)
     trn.n_interior_uniform, trn.n_interior_refine, trn.n_interior_tip_strip = original
     return pts
+
+
+def adaptive_residual_points(
+    model: nn.Module,
+    geo: GeometryParams,
+    mat: MaterialParams,
+    trn: TrainParams,
+    device: torch.device,
+    n_pick: int,
+) -> np.ndarray:
+    if n_pick <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    n_candidates = max(int(trn.adaptive_candidates), int(4 * n_pick))
+    candidates = sample_points_excluding_notch(geo, n_candidates)
+
+    chunk = max(16, min(int(trn.val_pde_chunk_size), n_candidates))
+    residual_abs = np.empty((n_candidates,), dtype=np.float32)
+
+    s = 0
+    while s < n_candidates:
+        e = min(s + chunk, n_candidates)
+        xy = to_tensor(candidates[s:e], device, requires_grad=True)
+        with torch.enable_grad():
+            r = pde_residual(model, xy, mat, create_graph=False)
+        residual_abs[s:e] = torch.abs(r).detach().cpu().numpy().astype(np.float32)
+        del xy, r
+        s = e
+
+    if n_pick >= n_candidates:
+        return candidates
+
+    top_idx = np.argpartition(residual_abs, -n_pick)[-n_pick:]
+    return candidates[top_idx].astype(np.float32)
+
+
+def point_in_tip_strip_region(x: float, y: float, geo: GeometryParams, trn: TrainParams) -> bool:
+    x0, y0 = geo.tip
+    xlo = max(geo.xmin, x0 - trn.tip_strip_length)
+    xhi = min(geo.xmax, x0)
+    if x < xlo or x > xhi:
+        return False
+    if y < max(geo.ymin, y0 - trn.tip_strip_half_height) or y > min(geo.ymax, y0 + trn.tip_strip_half_height):
+        return False
+    half_open = math.tan(geo.notch_angle / 2.0) * (x0 - x)
+    return abs(y - y0) <= half_open
+
+
+def sample_tip_strip_points(geo: GeometryParams, trn: TrainParams, n: int) -> np.ndarray:
+    x0, y0 = geo.tip
+    xlo = max(geo.xmin, x0 - trn.tip_strip_length)
+    xhi = min(geo.xmax, x0)
+    ylo = max(geo.ymin, y0 - trn.tip_strip_half_height)
+    yhi = min(geo.ymax, y0 + trn.tip_strip_half_height)
+
+    pts = np.empty((n, 2), dtype=np.float32)
+    k = 0
+    while k < n:
+        x = xlo + (xhi - xlo) * random.random()
+        y = ylo + (yhi - ylo) * random.random()
+        if point_in_tip_strip_region(x, y, geo, trn) and (not point_in_notch_void(x, y, geo)):
+            pts[k, 0] = x
+            pts[k, 1] = y
+            k += 1
+    return pts
+
+
+def filter_tip_strip_points(points: np.ndarray, geo: GeometryParams, trn: TrainParams) -> np.ndarray:
+    if points.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    mask = np.array(
+        [point_in_tip_strip_region(float(x), float(y), geo, trn) for x, y in points],
+        dtype=bool,
+    )
+    return points[mask].astype(np.float32)
 
 
 def notch_face_points(geo: GeometryParams, n: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -326,6 +409,29 @@ def to_tensor(x: np.ndarray, device: torch.device, requires_grad: bool = False) 
 def phi_scalar(model: nn.Module, xy: torch.Tensor) -> torch.Tensor:
     # xy: [N,2], returns [N]
     return model(xy).squeeze(-1)
+
+
+def compute_stress(
+    model: nn.Module,
+    xy: torch.Tensor,
+    create_graph: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not xy.requires_grad:
+        xy = xy.clone().detach().requires_grad_(True)
+
+    phi = phi_scalar(model, xy)
+    grad_phi = torch.autograd.grad(
+        phi,
+        xy,
+        grad_outputs=torch.ones_like(phi),
+        create_graph=create_graph,
+        retain_graph=create_graph,
+    )[0]
+
+    tau_xz = grad_phi[:, 1]
+    tau_yz = -grad_phi[:, 0]
+    tau_eq = torch.sqrt(tau_xz.pow(2) + tau_yz.pow(2) + 1e-12)
+    return tau_xz, tau_yz, tau_eq
 
 
 def pde_residual(
@@ -418,6 +524,23 @@ def weighted_pde_loss(
     return total / n
 
 
+def tip_stress_loss(
+    model: nn.Module,
+    tip_xy: torch.Tensor,
+    geo: GeometryParams,
+    trn: TrainParams,
+    create_graph: bool = True,
+) -> torch.Tensor:
+    if tip_xy.shape[0] == 0:
+        return torch.zeros((), dtype=torch.float32, device=tip_xy.device)
+
+    _, _, tau_eq = compute_stress(model, tip_xy, create_graph=create_graph)
+    x0, y0 = geo.tip
+    r = torch.sqrt((tip_xy[:, 0] - x0) ** 2 + (tip_xy[:, 1] - y0) ** 2 + 1e-12)
+    singular_scaled = tau_eq * torch.sqrt(r + trn.tip_stress_eps)
+    return torch.mean((singular_scaled - trn.tip_stress_c) ** 2)
+
+
 def boundary_loss(model: nn.Module, bdata_t: Dict[str, torch.Tensor], bc: BCParams) -> torch.Tensor:
     losses = []
     for label in ("G1", "G2", "G3", "G4"):
@@ -496,7 +619,7 @@ def streaming_pde_backward(
     device: torch.device,
     pde_weight: float,
 ) -> float:
-    if pde_weight <= 0.0:
+    if pde_weight <= 0.0 or trn.lambda_pde <= 0.0:
         return 0.0
 
     n_total = interior_np.shape[0]
@@ -518,7 +641,7 @@ def streaming_pde_backward(
                 chunk_size=None,
             )
             frac = (e - s) / n_total
-            (pde_weight * frac * lpde_chunk).backward()
+            (trn.lambda_pde * pde_weight * frac * lpde_chunk).backward()
             weighted_mean += float(lpde_chunk.detach().cpu()) * (e - s)
             del xy_chunk, lpde_chunk
             s = e
@@ -580,6 +703,100 @@ def streaming_pde_eval(
                 raise RuntimeError("CUDA OOM even at validation PDE chunk size 1.")
             new_chunk = max(1, chunk // 2)
             print(f"[OOM fallback] Reducing val PDE chunk size: {chunk} -> {new_chunk}")
+            chunk = new_chunk
+
+    return total / n_total
+
+
+def streaming_tip_stress_backward(
+    model: nn.Module,
+    tip_np: np.ndarray,
+    geo: GeometryParams,
+    trn: TrainParams,
+    device: torch.device,
+) -> float:
+    if trn.lambda_tip <= 0.0 or tip_np.shape[0] == 0:
+        return 0.0
+
+    n_total = tip_np.shape[0]
+    chunk = max(1, int(trn.train_pde_chunk_size))
+    weighted_mean = 0.0
+
+    s = 0
+    while s < n_total:
+        e = min(s + chunk, n_total)
+        try:
+            xy_chunk = to_tensor(tip_np[s:e], device, requires_grad=True)
+            ltip_chunk = tip_stress_loss(
+                model,
+                xy_chunk,
+                geo,
+                trn,
+                create_graph=True,
+            )
+            frac = (e - s) / n_total
+            (trn.lambda_tip * frac * ltip_chunk).backward()
+            weighted_mean += float(ltip_chunk.detach().cpu()) * (e - s)
+            del xy_chunk, ltip_chunk
+            s = e
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" not in msg:
+                raise
+            del exc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if chunk <= 1:
+                raise RuntimeError("CUDA OOM even at tip-stress chunk size 1.")
+            new_chunk = max(1, chunk // 2)
+            print(f"[OOM fallback] Reducing tip-stress chunk size: {chunk} -> {new_chunk}")
+            chunk = new_chunk
+
+    return weighted_mean / n_total
+
+
+def streaming_tip_stress_eval(
+    model: nn.Module,
+    tip_np: np.ndarray,
+    geo: GeometryParams,
+    trn: TrainParams,
+    device: torch.device,
+) -> torch.Tensor:
+    if tip_np.shape[0] == 0:
+        return torch.zeros((), dtype=torch.float32, device=device)
+
+    n_total = tip_np.shape[0]
+    chunk = max(1, int(trn.val_pde_chunk_size))
+    total = torch.zeros((), dtype=torch.float32, device=device)
+
+    s = 0
+    while s < n_total:
+        e = min(s + chunk, n_total)
+        try:
+            xy_chunk = to_tensor(tip_np[s:e], device, requires_grad=True)
+            ltip_chunk = tip_stress_loss(
+                model,
+                xy_chunk,
+                geo,
+                trn,
+                create_graph=False,
+            )
+            total = total + ltip_chunk * (e - s)
+            del xy_chunk, ltip_chunk
+            s = e
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" not in msg:
+                raise
+            del exc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if chunk <= 1:
+                raise RuntimeError("CUDA OOM even at validation tip-stress chunk size 1.")
+            new_chunk = max(1, chunk // 2)
+            print(f"[OOM fallback] Reducing val tip-stress chunk size: {chunk} -> {new_chunk}")
             chunk = new_chunk
 
     return total / n_total
@@ -680,8 +897,10 @@ def tip_gradient_indicator(model: nn.Module, geo: GeometryParams, device: torch.
     near_t = to_tensor(np.stack([xnear, ynear], axis=1), device, requires_grad=True)
     far_t = to_tensor(np.stack([xfar, yfar], axis=1), device, requires_grad=True)
 
-    gnear = grad_mag(model, near_t).detach().cpu().numpy()
-    gfar = grad_mag(model, far_t).detach().cpu().numpy()
+    _, _, tnear = compute_stress(model, near_t, create_graph=False)
+    _, _, tfar = compute_stress(model, far_t, create_graph=False)
+    gnear = tnear.detach().cpu().numpy()
+    gfar = tfar.detach().cpu().numpy()
 
     near_mean = float(gnear.mean())
     far_mean = float(gfar.mean())
@@ -720,7 +939,7 @@ def run_cross_verification(model: nn.Module, mat: MaterialParams, geo: GeometryP
         f"mean|ΔΦ|={sstats['mean_abs']:.5e}, max|ΔΦ|={sstats['max_abs']:.5e} (pairs={sstats['n_pairs']})"
     )
     print(
-        "  Tip gradient  | "
+        "  Tip stress ratio (τ_eq) | "
         f"near={tipstats['near_mean']:.5e}, far={tipstats['far_mean']:.5e}, near/far={tipstats['ratio']:.3f}"
     )
     print(
@@ -779,21 +998,22 @@ def save_plots(
     plt.savefig(outdir / "phi_field.png", dpi=160)
     plt.close()
 
-    # |grad phi| approaching tip along y=y0
+    # tau_eq approaching tip along y=y0
     x0, y0 = geo.tip
     xline = np.linspace(geo.xmin, x0, 300, dtype=np.float32)
     yline = np.full_like(xline, y0)
     xy = to_tensor(np.stack([xline, yline], axis=1), device, requires_grad=True)
-    gline = grad_mag(model, xy).detach().cpu().numpy()
+    _, _, tau_eq_line = compute_stress(model, xy, create_graph=False)
+    gline = tau_eq_line.detach().cpu().numpy()
     dist_to_tip = x0 - xline
 
     plt.figure(figsize=(7, 4))
     plt.plot(dist_to_tip, gline, lw=2)
     plt.xlabel("Distance to notch tip")
-    plt.ylabel("|∇Φ|")
-    plt.title("Gradient magnitude along reference line")
+    plt.ylabel("τ_eq")
+    plt.title("Equivalent shear stress along reference line")
     plt.tight_layout()
-    plt.savefig(outdir / "gradmag_reference_line.png", dpi=160)
+    plt.savefig(outdir / "tau_eq_reference_line.png", dpi=160)
     plt.close()
 
 
@@ -824,6 +1044,7 @@ def train_model(
     total_epochs = trn.adam_epochs + trn.finetune_epochs
 
     val_interior = sample_interior_points_val(geo, trn)
+    val_tip_interior = filter_tip_strip_points(val_interior, geo, trn)
     val_bdata = sample_boundary_points(geo, trn.val_n_boundary_each)
 
     val_bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in val_bdata.items()}
@@ -837,40 +1058,52 @@ def train_model(
     loss_hist: list[float] = []
     pde_hist: list[float] = []
     bc_hist: list[float] = []
+    tip_hist: list[float] = []
     val_hist: list[float] = []
+    val_select_hist: list[float] = []
 
     ckpt_path = outdir / "best_checkpoint.pt"
 
     def save_checkpoint() -> None:
+        last_state = copy.deepcopy(model.state_dict())
         torch.save(
             {
-                "model_state": model.state_dict(),
+                "model_state": last_state,
+                "best_model_state": best_state,
+                "last_model_state": last_state,
                 "best_epoch": best_epoch,
                 "best_val": best_val,
                 "loss_total": loss_hist,
                 "loss_pde": pde_hist,
                 "loss_bc": bc_hist,
+                "loss_tip": tip_hist,
                 "loss_val": val_hist,
+                "loss_val_select": val_select_hist,
+                "completed_epochs": len(loss_hist),
             },
             ckpt_path,
         )
 
     if resume and ckpt_path.is_file():
         ckpt = torch.load(ckpt_path, map_location=device)
-        if "model_state" in ckpt:
-            model.load_state_dict(ckpt["model_state"])
-            best_state = copy.deepcopy(model.state_dict())
+        last_state_key = "last_model_state" if "last_model_state" in ckpt else "model_state"
+        best_state_key = "best_model_state" if "best_model_state" in ckpt else last_state_key
+        if last_state_key in ckpt:
+            model.load_state_dict(ckpt[last_state_key])
+            best_state = copy.deepcopy(ckpt[best_state_key]) if best_state_key in ckpt else copy.deepcopy(model.state_dict())
             best_epoch = int(ckpt.get("best_epoch", 0))
             best_val = float(ckpt.get("best_val", float("inf")))
             loss_hist = list(ckpt.get("loss_total", []))
             pde_hist = list(ckpt.get("loss_pde", []))
             bc_hist = list(ckpt.get("loss_bc", []))
+            tip_hist = list(ckpt.get("loss_tip", []))
             val_hist = list(ckpt.get("loss_val", []))
-            completed_epochs = len(loss_hist)
+            val_select_hist = list(ckpt.get("loss_val_select", ckpt.get("loss_val", [])))
+            completed_epochs = int(ckpt.get("completed_epochs", len(loss_hist)))
             stale_epochs = 0
             print(
                 f"Resuming from checkpoint: epoch {completed_epochs}/{total_epochs} | "
-                f"best_epoch={best_epoch} best_val={best_val:.6f}"
+                f"best_epoch={best_epoch} best_val={best_val:.6f} (resume=last_state)"
             )
 
     t0 = time.time()
@@ -890,6 +1123,21 @@ def train_model(
     for epoch in range(adam_start, trn.adam_epochs + 1):
         model.train()
         interior = sample_interior_points(geo, trn)
+        if trn.adaptive_sampling and epoch >= trn.adaptive_start_epoch:
+            try:
+                n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
+                if n_adapt > 0:
+                    adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
+                    if adapt_pts.size > 0:
+                        interior = np.vstack([interior, adapt_pts]).astype(np.float32)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "out of memory" not in msg:
+                    raise
+                print("[adaptive sampling] OOM encountered; skipping adaptive points this epoch.")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         bdata = sample_boundary_points(geo, trn.n_boundary_each)
 
         bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in bdata.items()}
@@ -902,8 +1150,10 @@ def train_model(
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
         base_loss.backward()
 
+        tip_interior = filter_tip_strip_points(interior, geo, trn)
+        ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
         lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
-        ltot_f = float(base_loss.detach().cpu()) + pde_weight * lpde_f
+        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_pde * pde_weight * lpde_f
 
         if trn.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
@@ -914,34 +1164,42 @@ def train_model(
         if do_validate:
             model.eval()
             with torch.enable_grad():
-                if pde_weight > 0.0:
+                if pde_weight > 0.0 or trn.model_select_pde_weight_floor > 0.0:
                     v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
+                v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
                 v_lbc = boundary_loss(model, val_bdata_t, bc)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = pde_weight * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
+                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
             lval_f = float(lval.detach().cpu())
+            lval_select_f = float(lval_select.detach().cpu())
         else:
             lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
+            lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
 
         lbc_f = float(lbc.detach().cpu())
 
         loss_hist.append(ltot_f)
         pde_hist.append(lpde_f)
         bc_hist.append(lbc_f)
+        tip_hist.append(ltip_f)
         val_hist.append(lval_f)
+        val_select_hist.append(lval_select_f)
 
         if do_validate:
-            if lval_f < best_val - trn.min_improve:
-                best_val = lval_f
-                best_epoch = epoch
-                stale_epochs = 0
-                best_state = copy.deepcopy(model.state_dict())
-                save_checkpoint()
-            else:
-                stale_epochs += 1
+            if epoch >= trn.model_select_start_epoch:
+                if lval_select_f < best_val - trn.min_improve:
+                    best_val = lval_select_f
+                    best_epoch = epoch
+                    stale_epochs = 0
+                    best_state = copy.deepcopy(model.state_dict())
+                    save_checkpoint()
+                else:
+                    stale_epochs += 1
 
         if trn.checkpoint_every > 0 and (epoch % trn.checkpoint_every == 0):
             save_checkpoint()
@@ -953,8 +1211,9 @@ def train_model(
             val_tag = "val" if do_validate else "val(skip)"
             print(
                 f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
-                f"Lval={lval_f:.5e} ({val_tag}) | wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
+                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lbc={lbc_f:.5e} | "
+                f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
+                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
@@ -973,6 +1232,21 @@ def train_model(
         model.train()
 
         interior = sample_interior_points(geo, trn)
+        if trn.adaptive_sampling and epoch >= trn.adaptive_start_epoch:
+            try:
+                n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
+                if n_adapt > 0:
+                    adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
+                    if adapt_pts.size > 0:
+                        interior = np.vstack([interior, adapt_pts]).astype(np.float32)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "out of memory" not in msg:
+                    raise
+                print("[adaptive sampling] OOM encountered; skipping adaptive points this epoch.")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         bdata = sample_boundary_points(geo, trn.n_boundary_each)
         bdata_t = {kk: to_tensor(vv, device, requires_grad=False) for kk, vv in bdata.items()}
         pde_weight = pde_curriculum_weight(epoch, trn)
@@ -984,8 +1258,10 @@ def train_model(
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
         base_loss.backward()
 
+        tip_interior = filter_tip_strip_points(interior, geo, trn)
+        ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
         lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
-        ltot_f = float(base_loss.detach().cpu()) + pde_weight * lpde_f
+        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_pde * pde_weight * lpde_f
 
         if trn.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
@@ -996,34 +1272,42 @@ def train_model(
         if do_validate:
             model.eval()
             with torch.enable_grad():
-                if pde_weight > 0.0:
+                if pde_weight > 0.0 or trn.model_select_pde_weight_floor > 0.0:
                     v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
+                v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
                 v_lbc = boundary_loss(model, val_bdata_t, bc)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = pde_weight * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
+                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
             lval_f = float(lval.detach().cpu())
+            lval_select_f = float(lval_select.detach().cpu())
         else:
             lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
+            lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
 
         lbc_f = float(lbc.detach().cpu())
 
         loss_hist.append(ltot_f)
         pde_hist.append(lpde_f)
         bc_hist.append(lbc_f)
+        tip_hist.append(ltip_f)
         val_hist.append(lval_f)
+        val_select_hist.append(lval_select_f)
 
         if do_validate:
-            if lval_f < best_val - trn.min_improve:
-                best_val = lval_f
-                best_epoch = epoch
-                stale_epochs = 0
-                best_state = copy.deepcopy(model.state_dict())
-                save_checkpoint()
-            else:
-                stale_epochs += 1
+            if epoch >= trn.model_select_start_epoch:
+                if lval_select_f < best_val - trn.min_improve:
+                    best_val = lval_select_f
+                    best_epoch = epoch
+                    stale_epochs = 0
+                    best_state = copy.deepcopy(model.state_dict())
+                    save_checkpoint()
+                else:
+                    stale_epochs += 1
 
         if trn.checkpoint_every > 0 and (epoch % trn.checkpoint_every == 0):
             save_checkpoint()
@@ -1035,8 +1319,9 @@ def train_model(
             val_tag = "val" if do_validate else "val(skip)"
             print(
                 f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
-                f"Lval={lval_f:.5e} ({val_tag}) | wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
+                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lbc={lbc_f:.5e} | "
+                f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
+                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
@@ -1063,15 +1348,22 @@ def env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def main():
     trn = TrainParams(
-        adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 6000)),
-        finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 4000),
+        adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 4000)),
+        finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 6000),
         pretrain_epochs=env_int("KAN_PINN_PRETRAIN_EPOCHS", 1000),
         pde_ramp_epochs=env_int("KAN_PINN_PDE_RAMP_EPOCHS", 2000),
         n_interior_uniform=env_int("KAN_PINN_NU", 64),
         n_interior_refine=env_int("KAN_PINN_NR", 128),
-        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 4096),
+        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 5000),
         n_boundary_each=env_int("KAN_PINN_NB", 48),
         val_n_interior_uniform=env_int("KAN_PINN_VAL_NU", 192),
         val_n_interior_refine=env_int("KAN_PINN_VAL_NR", 192),
@@ -1079,18 +1371,28 @@ def main():
         val_n_boundary_each=env_int("KAN_PINN_VAL_NB", 96),
         lambda_bc=env_float("KAN_PINN_LAMBDA_BC", 300.0),
         lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 10.0),
-        learning_rate=env_float("KAN_PINN_LR", 1e-3),
+        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 10.0),
+        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 1.0),
+        learning_rate=env_float("KAN_PINN_LR", 1e-4),
         finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 1e-4),
         print_every=env_int("KAN_PINN_PRINT_EVERY", 50),
         validation_every=env_int("KAN_PINN_VAL_EVERY", 10),
         checkpoint_every=env_int("KAN_PINN_CHECKPOINT_EVERY", 25),
         early_stop_patience=env_int("KAN_PINN_PATIENCE", 300),
         min_improve=env_float("KAN_PINN_MIN_IMPROVE", 1e-4),
-        max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 5.0),
-        train_pde_chunk_size=env_int("KAN_PINN_TRAIN_PDE_CHUNK", 32),
-        val_pde_chunk_size=env_int("KAN_PINN_VAL_PDE_CHUNK", 32),
+        max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 1.0),
+        model_select_start_epoch=env_int("KAN_PINN_MODEL_SELECT_START_EPOCH", env_int("KAN_PINN_PRETRAIN_EPOCHS", 1000) + 1),
+        model_select_pde_weight_floor=env_float("KAN_PINN_MODEL_SELECT_PDE_FLOOR", 1.0),
+        train_pde_chunk_size=env_int("KAN_PINN_TRAIN_PDE_CHUNK", 256),
+        val_pde_chunk_size=env_int("KAN_PINN_VAL_PDE_CHUNK", 256),
         tip_strip_half_height=env_float("KAN_PINN_TIP_STRIP_HH", 0.02),
         tip_strip_length=env_float("KAN_PINN_TIP_STRIP_LEN", 0.12),
+        tip_stress_c=env_float("KAN_PINN_TIP_STRESS_C", 1.0),
+        tip_stress_eps=env_float("KAN_PINN_TIP_STRESS_EPS", 1e-5),
+        adaptive_sampling=env_bool("KAN_PINN_ADAPTIVE_SAMPLING", False),
+        adaptive_candidates=env_int("KAN_PINN_ADAPTIVE_CANDIDATES", 4096),
+        adaptive_topk=env_int("KAN_PINN_ADAPTIVE_TOPK", 512),
+        adaptive_start_epoch=env_int("KAN_PINN_ADAPTIVE_START_EPOCH", 200),
         seed=env_int("KAN_PINN_SEED", 42),
     )
 
