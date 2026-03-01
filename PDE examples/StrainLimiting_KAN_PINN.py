@@ -97,9 +97,13 @@ class TrainParams:
     lambda_sym: float = 10.0
     lambda_pde: float = 10.0
     lambda_tip: float = 1.0
+    lambda_tip_ratio: float = 20.0
 
     tip_stress_c: float = 1.0
     tip_stress_eps: float = 1e-5
+    tip_ratio_target: float = 1.0
+    tip_strip_bias_power: float = 2.5
+    tip_loss_r_weight_power: float = 0.5
 
     learning_rate: float = 1e-4
     finetune_lr: float = 1e-4
@@ -333,8 +337,12 @@ def sample_tip_strip_points(geo: GeometryParams, trn: TrainParams, n: int) -> np
 
     pts = np.empty((n, 2), dtype=np.float32)
     k = 0
+    bias = max(1e-6, float(trn.tip_strip_bias_power))
+    span = max(1e-12, float(x0 - xlo))
     while k < n:
-        x = xlo + (xhi - xlo) * random.random()
+        u = random.random()
+        x = x0 - span * (u ** bias)
+        x = min(max(x, xlo), xhi)
         y = ylo + (yhi - ylo) * random.random()
         if point_in_tip_strip_region(x, y, geo, trn) and (not point_in_notch_void(x, y, geo)):
             pts[k, 0] = x
@@ -538,7 +546,44 @@ def tip_stress_loss(
     x0, y0 = geo.tip
     r = torch.sqrt((tip_xy[:, 0] - x0) ** 2 + (tip_xy[:, 1] - y0) ** 2 + 1e-12)
     singular_scaled = tau_eq * torch.sqrt(r + trn.tip_stress_eps)
-    return torch.mean((singular_scaled - trn.tip_stress_c) ** 2)
+    mismatch2 = (singular_scaled - trn.tip_stress_c) ** 2
+    if trn.tip_loss_r_weight_power <= 0.0:
+        return torch.mean(mismatch2)
+    w = 1.0 / torch.pow(r + trn.tip_stress_eps, trn.tip_loss_r_weight_power)
+    return torch.sum(w * mismatch2) / (torch.sum(w) + 1e-12)
+
+
+def tip_stress_ratio_loss(
+    model: nn.Module,
+    geo: GeometryParams,
+    trn: TrainParams,
+    device: torch.device,
+    create_graph: bool = True,
+    n_near: int = 96,
+    n_far: int = 96,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x0, y0 = geo.tip
+    near_lo = max(geo.xmin, x0 - 0.06)
+    near_hi = x0 - 0.005
+    far_lo = geo.xmin
+    far_hi = max(geo.xmin, x0 - 0.20)
+
+    xnear = torch.linspace(near_lo, near_hi, n_near, device=device)
+    xfar = torch.linspace(far_lo, far_hi, n_far, device=device)
+    ynear = torch.full_like(xnear, y0)
+    yfar = torch.full_like(xfar, y0)
+
+    near_xy = torch.stack([xnear, ynear], dim=1).requires_grad_(True)
+    far_xy = torch.stack([xfar, yfar], dim=1).requires_grad_(True)
+
+    _, _, tnear = compute_stress(model, near_xy, create_graph=create_graph)
+    _, _, tfar = compute_stress(model, far_xy, create_graph=create_graph)
+
+    near_mean = torch.mean(tnear)
+    far_mean = torch.mean(tfar)
+    ratio = near_mean / (far_mean + 1e-8)
+    loss = torch.relu(trn.tip_ratio_target - ratio) ** 2
+    return loss, ratio
 
 
 def boundary_loss(model: nn.Module, bdata_t: Dict[str, torch.Tensor], bc: BCParams) -> torch.Tensor:
@@ -1044,7 +1089,7 @@ def train_model(
     total_epochs = trn.adam_epochs + trn.finetune_epochs
 
     val_interior = sample_interior_points_val(geo, trn)
-    val_tip_interior = filter_tip_strip_points(val_interior, geo, trn)
+    val_tip_interior = sample_tip_strip_points(geo, trn, trn.val_n_interior_tip_strip)
     val_bdata = sample_boundary_points(geo, trn.val_n_boundary_each)
 
     val_bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in val_bdata.items()}
@@ -1059,6 +1104,7 @@ def train_model(
     pde_hist: list[float] = []
     bc_hist: list[float] = []
     tip_hist: list[float] = []
+    tip_ratio_hist: list[float] = []
     val_hist: list[float] = []
     val_select_hist: list[float] = []
 
@@ -1077,6 +1123,7 @@ def train_model(
                 "loss_pde": pde_hist,
                 "loss_bc": bc_hist,
                 "loss_tip": tip_hist,
+                "loss_tip_ratio": tip_ratio_hist,
                 "loss_val": val_hist,
                 "loss_val_select": val_select_hist,
                 "completed_epochs": len(loss_hist),
@@ -1097,6 +1144,7 @@ def train_model(
             pde_hist = list(ckpt.get("loss_pde", []))
             bc_hist = list(ckpt.get("loss_bc", []))
             tip_hist = list(ckpt.get("loss_tip", []))
+            tip_ratio_hist = list(ckpt.get("loss_tip_ratio", []))
             val_hist = list(ckpt.get("loss_val", []))
             val_select_hist = list(ckpt.get("loss_val_select", ckpt.get("loss_val", [])))
             completed_epochs = int(ckpt.get("completed_epochs", len(loss_hist)))
@@ -1150,10 +1198,14 @@ def train_model(
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
         base_loss.backward()
 
-        tip_interior = filter_tip_strip_points(interior, geo, trn)
+        tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
         ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
+        lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
+        (trn.lambda_tip_ratio * lratio_t).backward()
+        lratio_f = float(lratio_t.detach().cpu())
+        ratio_f = float(ratio_t.detach().cpu())
         lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
-        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_pde * pde_weight * lpde_f
+        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_tip_ratio * lratio_f + trn.lambda_pde * pde_weight * lpde_f
 
         if trn.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
@@ -1169,17 +1221,20 @@ def train_model(
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
                 v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
+                v_lratio, v_ratio = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
                 v_lbc = boundary_loss(model, val_bdata_t, bc)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
                 select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
             lval_f = float(lval.detach().cpu())
             lval_select_f = float(lval_select.detach().cpu())
+            v_ratio_f = float(v_ratio.detach().cpu())
         else:
             lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
             lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
+            v_ratio_f = float("nan")
 
         lbc_f = float(lbc.detach().cpu())
 
@@ -1187,6 +1242,7 @@ def train_model(
         pde_hist.append(lpde_f)
         bc_hist.append(lbc_f)
         tip_hist.append(ltip_f)
+        tip_ratio_hist.append(lratio_f)
         val_hist.append(lval_f)
         val_select_hist.append(lval_select_f)
 
@@ -1211,9 +1267,9 @@ def train_model(
             val_tag = "val" if do_validate else "val(skip)"
             print(
                 f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lbc={lbc_f:.5e} | "
+                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lratio={lratio_f:.5e} | Lbc={lbc_f:.5e} | "
                 f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
-                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
+                f"ratio(trn)={ratio_f:.3f} ratio(val)={v_ratio_f:.3f} | wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
@@ -1258,10 +1314,14 @@ def train_model(
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
         base_loss.backward()
 
-        tip_interior = filter_tip_strip_points(interior, geo, trn)
+        tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
         ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
+        lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
+        (trn.lambda_tip_ratio * lratio_t).backward()
+        lratio_f = float(lratio_t.detach().cpu())
+        ratio_f = float(ratio_t.detach().cpu())
         lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
-        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_pde * pde_weight * lpde_f
+        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_tip_ratio * lratio_f + trn.lambda_pde * pde_weight * lpde_f
 
         if trn.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
@@ -1277,17 +1337,20 @@ def train_model(
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
                 v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
+                v_lratio, v_ratio = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
                 v_lbc = boundary_loss(model, val_bdata_t, bc)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
                 select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
             lval_f = float(lval.detach().cpu())
             lval_select_f = float(lval_select.detach().cpu())
+            v_ratio_f = float(v_ratio.detach().cpu())
         else:
             lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
             lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
+            v_ratio_f = float("nan")
 
         lbc_f = float(lbc.detach().cpu())
 
@@ -1295,6 +1358,7 @@ def train_model(
         pde_hist.append(lpde_f)
         bc_hist.append(lbc_f)
         tip_hist.append(ltip_f)
+        tip_ratio_hist.append(lratio_f)
         val_hist.append(lval_f)
         val_select_hist.append(lval_select_f)
 
@@ -1319,9 +1383,9 @@ def train_model(
             val_tag = "val" if do_validate else "val(skip)"
             print(
                 f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lbc={lbc_f:.5e} | "
+                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lratio={lratio_f:.5e} | Lbc={lbc_f:.5e} | "
                 f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
-                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
+                f"ratio(trn)={ratio_f:.3f} ratio(val)={v_ratio_f:.3f} | wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
@@ -1373,6 +1437,7 @@ def main():
         lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 10.0),
         lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 10.0),
         lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 1.0),
+        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 20.0),
         learning_rate=env_float("KAN_PINN_LR", 1e-4),
         finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 1e-4),
         print_every=env_int("KAN_PINN_PRINT_EVERY", 50),
@@ -1389,6 +1454,9 @@ def main():
         tip_strip_length=env_float("KAN_PINN_TIP_STRIP_LEN", 0.12),
         tip_stress_c=env_float("KAN_PINN_TIP_STRESS_C", 1.0),
         tip_stress_eps=env_float("KAN_PINN_TIP_STRESS_EPS", 1e-5),
+        tip_ratio_target=env_float("KAN_PINN_TIP_RATIO_TARGET", 1.0),
+        tip_strip_bias_power=env_float("KAN_PINN_TIP_STRIP_BIAS_POWER", 2.5),
+        tip_loss_r_weight_power=env_float("KAN_PINN_TIP_R_WEIGHT_POWER", 0.5),
         adaptive_sampling=env_bool("KAN_PINN_ADAPTIVE_SAMPLING", False),
         adaptive_candidates=env_int("KAN_PINN_ADAPTIVE_CANDIDATES", 4096),
         adaptive_topk=env_int("KAN_PINN_ADAPTIVE_TOPK", 512),
