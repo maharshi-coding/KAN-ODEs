@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
 """
 KAN-PINN (PyTorch) for the strain-limiting PDE (Equation 40):
 
@@ -34,9 +35,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -49,8 +47,8 @@ import torch.nn as nn
 @dataclass
 class MaterialParams:
     mu: float = 1.0
-    beta: float = 5.0
-    alpha: float = 2.0
+    beta: float = 1.0
+    alpha: float = 0.2
 
 
 @dataclass
@@ -77,27 +75,27 @@ class BCParams:
 
 @dataclass
 class TrainParams:
-    adam_epochs: int = 4000
-    finetune_epochs: int = 6000
-    pretrain_epochs: int = 1000
-    pde_ramp_epochs: int = 2000
+    adam_epochs: int = 8000
+    finetune_epochs: int = 8000
+    pretrain_epochs: int = 1500
+    pde_ramp_epochs: int = 3000
 
-    n_interior_uniform: int = 64
-    n_interior_refine: int = 128
-    n_interior_tip_strip: int = 5000
-    n_boundary_each: int = 48
+    n_interior_uniform: int = 256
+    n_interior_refine: int = 256
+    n_interior_tip_strip: int = 2000
+    n_boundary_each: int = 64
 
-    val_n_interior_uniform: int = 192
-    val_n_interior_refine: int = 192
-    val_n_interior_tip_strip: int = 8192
+    val_n_interior_uniform: int = 256
+    val_n_interior_refine: int = 256
+    val_n_interior_tip_strip: int = 4096
     val_n_boundary_each: int = 96
 
-    lambda_bc: float = 300.0
-    lambda_gauge: float = 1e-3
-    lambda_sym: float = 10.0
-    lambda_pde: float = 10.0
-    lambda_tip: float = 1.0
-    lambda_tip_ratio: float = 20.0
+    lambda_bc: float = 10.0
+    lambda_gauge: float = 0.01
+    lambda_sym: float = 5.0
+    lambda_pde: float = 1.0
+    lambda_tip: float = 0.0
+    lambda_tip_ratio: float = 0.0
 
     tip_stress_c: float = 1.0
     tip_stress_eps: float = 1e-5
@@ -105,18 +103,18 @@ class TrainParams:
     tip_strip_bias_power: float = 2.5
     tip_loss_r_weight_power: float = 0.5
 
-    learning_rate: float = 1e-4
-    finetune_lr: float = 1e-4
+    learning_rate: float = 3e-4
+    finetune_lr: float = 5e-5
 
     print_every: int = 50
     validation_every: int = 10
-    checkpoint_every: int = 25
-    early_stop_patience: int = 300
-    min_improve: float = 1e-4
+    checkpoint_every: int = 50
+    early_stop_patience: int = 99999
+    min_improve: float = 1e-5
     max_grad_norm: float = 1.0
 
     # Best-model selection (physics-aware)
-    model_select_start_epoch: int = 1001
+    model_select_start_epoch: int = 1501
     model_select_pde_weight_floor: float = 1.0
 
     # Singular weighting w=1/(dist_to_tip+eps)
@@ -146,6 +144,9 @@ class TrainParams:
     # Model shape
     hidden: int = 96
     n_basis: int = 48
+
+    # PDE tip weighting control (0 = plain MSE, no singular weighting)
+    tip_weight_power: float = 0.0
 
 
 # -----------------------------
@@ -515,18 +516,26 @@ def weighted_pde_loss(
         res = pde_residual(model, interior_xy, mat, create_graph=create_graph)
         x0, y0 = geo.tip
         dist = torch.sqrt((interior_xy[:, 0] - x0) ** 2 + (interior_xy[:, 1] - y0) ** 2 + 1e-12)
-        w = 1.0 / (dist**1.5 + trn.tip_weight_eps)
-        return torch.mean(torch.log1p((w * res) ** 2))
+        pw = max(0.0, float(trn.tip_weight_power))
+        if pw > 0.0:
+            w = 1.0 / (torch.pow(dist, pw) + trn.tip_weight_eps)
+        else:
+            w = torch.ones_like(dist)
+        return torch.mean((w * res) ** 2)
 
     x0, y0 = geo.tip
     total = torch.zeros((), dtype=torch.float32, device=interior_xy.device)
+    pw = max(0.0, float(trn.tip_weight_power))
     for s in range(0, n, chunk_size):
         e = min(s + chunk_size, n)
         xy_chunk = interior_xy[s:e]
         res = pde_residual(model, xy_chunk, mat, create_graph=create_graph)
         dist = torch.sqrt((xy_chunk[:, 0] - x0) ** 2 + (xy_chunk[:, 1] - y0) ** 2 + 1e-12)
-        w = 1.0 / (dist**1.5 + trn.tip_weight_eps)
-        chunk_loss = torch.mean(torch.log1p((w * res) ** 2))
+        if pw > 0.0:
+            w = 1.0 / (torch.pow(dist, pw) + trn.tip_weight_eps)
+        else:
+            w = torch.ones_like(dist)
+        chunk_loss = torch.mean((w * res) ** 2)
         total = total + chunk_loss * (e - s)
 
     return total / n
@@ -588,7 +597,9 @@ def tip_stress_ratio_loss(
 
 def boundary_loss(model: nn.Module, bdata_t: Dict[str, torch.Tensor], bc: BCParams) -> torch.Tensor:
     losses = []
-    for label in ("G1", "G2", "G3", "G4"):
+    for label in ("G1", "G2", "G3", "G4", "G5a", "G5b"):
+        if label not in bdata_t:
+            continue
         xy = bdata_t[label]
         pred = phi_scalar(model, xy)
         tgt = dirichlet_target(label, xy, bc)
@@ -1007,6 +1018,10 @@ def save_plots(
     outdir: Path,
     device: torch.device,
 ):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Loss history
@@ -1198,12 +1213,17 @@ def train_model(
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
         base_loss.backward()
 
-        tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
-        ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
-        lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
-        (trn.lambda_tip_ratio * lratio_t).backward()
-        lratio_f = float(lratio_t.detach().cpu())
-        ratio_f = float(ratio_t.detach().cpu())
+        ltip_f = 0.0
+        lratio_f = 0.0
+        ratio_f = 0.0
+        if trn.lambda_tip > 0.0:
+            tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
+            ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
+        if trn.lambda_tip_ratio > 0.0:
+            lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
+            (trn.lambda_tip_ratio * lratio_t).backward()
+            lratio_f = float(lratio_t.detach().cpu())
+            ratio_f = float(ratio_t.detach().cpu())
         lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
         ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_tip_ratio * lratio_f + trn.lambda_pde * pde_weight * lpde_f
 
@@ -1220,21 +1240,17 @@ def train_model(
                     v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
-                v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
-                v_lratio, v_ratio = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
                 v_lbc = boundary_loss(model, val_bdata_t, bc)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
                 select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
             lval_f = float(lval.detach().cpu())
             lval_select_f = float(lval_select.detach().cpu())
-            v_ratio_f = float(v_ratio.detach().cpu())
         else:
             lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
             lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
-            v_ratio_f = float("nan")
 
         lbc_f = float(lbc.detach().cpu())
 
@@ -1267,9 +1283,9 @@ def train_model(
             val_tag = "val" if do_validate else "val(skip)"
             print(
                 f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lratio={lratio_f:.5e} | Lbc={lbc_f:.5e} | "
+                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
                 f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
-                f"ratio(trn)={ratio_f:.3f} ratio(val)={v_ratio_f:.3f} | wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
+                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
@@ -1314,12 +1330,17 @@ def train_model(
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
         base_loss.backward()
 
-        tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
-        ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
-        lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
-        (trn.lambda_tip_ratio * lratio_t).backward()
-        lratio_f = float(lratio_t.detach().cpu())
-        ratio_f = float(ratio_t.detach().cpu())
+        ltip_f = 0.0
+        lratio_f = 0.0
+        ratio_f = 0.0
+        if trn.lambda_tip > 0.0:
+            tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
+            ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
+        if trn.lambda_tip_ratio > 0.0:
+            lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
+            (trn.lambda_tip_ratio * lratio_t).backward()
+            lratio_f = float(lratio_t.detach().cpu())
+            ratio_f = float(ratio_t.detach().cpu())
         lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
         ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_tip_ratio * lratio_f + trn.lambda_pde * pde_weight * lpde_f
 
@@ -1336,21 +1357,17 @@ def train_model(
                     v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
-                v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
-                v_lratio, v_ratio = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
                 v_lbc = boundary_loss(model, val_bdata_t, bc)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
                 select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_tip * v_ltip + trn.lambda_tip_ratio * v_lratio + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
             lval_f = float(lval.detach().cpu())
             lval_select_f = float(lval_select.detach().cpu())
-            v_ratio_f = float(v_ratio.detach().cpu())
         else:
             lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
             lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
-            v_ratio_f = float("nan")
 
         lbc_f = float(lbc.detach().cpu())
 
@@ -1383,9 +1400,9 @@ def train_model(
             val_tag = "val" if do_validate else "val(skip)"
             print(
                 f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Ltip={ltip_f:.5e} | Lratio={lratio_f:.5e} | Lbc={lbc_f:.5e} | "
+                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
                 f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
-                f"ratio(trn)={ratio_f:.3f} ratio(val)={v_ratio_f:.3f} | wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
+                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
@@ -1421,32 +1438,32 @@ def env_bool(name: str, default: bool) -> bool:
 
 def main():
     trn = TrainParams(
-        adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 4000)),
-        finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 6000),
-        pretrain_epochs=env_int("KAN_PINN_PRETRAIN_EPOCHS", 1000),
-        pde_ramp_epochs=env_int("KAN_PINN_PDE_RAMP_EPOCHS", 2000),
-        n_interior_uniform=env_int("KAN_PINN_NU", 64),
-        n_interior_refine=env_int("KAN_PINN_NR", 128),
-        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 5000),
-        n_boundary_each=env_int("KAN_PINN_NB", 48),
-        val_n_interior_uniform=env_int("KAN_PINN_VAL_NU", 192),
-        val_n_interior_refine=env_int("KAN_PINN_VAL_NR", 192),
-        val_n_interior_tip_strip=env_int("KAN_PINN_VAL_NTIP", 8192),
+        adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 8000)),
+        finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 8000),
+        pretrain_epochs=env_int("KAN_PINN_PRETRAIN_EPOCHS", 1500),
+        pde_ramp_epochs=env_int("KAN_PINN_PDE_RAMP_EPOCHS", 3000),
+        n_interior_uniform=env_int("KAN_PINN_NU", 256),
+        n_interior_refine=env_int("KAN_PINN_NR", 256),
+        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 2000),
+        n_boundary_each=env_int("KAN_PINN_NB", 64),
+        val_n_interior_uniform=env_int("KAN_PINN_VAL_NU", 256),
+        val_n_interior_refine=env_int("KAN_PINN_VAL_NR", 256),
+        val_n_interior_tip_strip=env_int("KAN_PINN_VAL_NTIP", 4096),
         val_n_boundary_each=env_int("KAN_PINN_VAL_NB", 96),
-        lambda_bc=env_float("KAN_PINN_LAMBDA_BC", 300.0),
-        lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 10.0),
-        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 10.0),
-        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 1.0),
-        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 20.0),
-        learning_rate=env_float("KAN_PINN_LR", 1e-4),
-        finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 1e-4),
+        lambda_bc=env_float("KAN_PINN_LAMBDA_BC", 10.0),
+        lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 5.0),
+        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 1.0),
+        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 0.0),
+        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 0.0),
+        learning_rate=env_float("KAN_PINN_LR", 3e-4),
+        finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 5e-5),
         print_every=env_int("KAN_PINN_PRINT_EVERY", 50),
         validation_every=env_int("KAN_PINN_VAL_EVERY", 10),
-        checkpoint_every=env_int("KAN_PINN_CHECKPOINT_EVERY", 25),
-        early_stop_patience=env_int("KAN_PINN_PATIENCE", 300),
-        min_improve=env_float("KAN_PINN_MIN_IMPROVE", 1e-4),
+        checkpoint_every=env_int("KAN_PINN_CHECKPOINT_EVERY", 50),
+        early_stop_patience=env_int("KAN_PINN_PATIENCE", 99999),
+        min_improve=env_float("KAN_PINN_MIN_IMPROVE", 1e-5),
         max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 1.0),
-        model_select_start_epoch=env_int("KAN_PINN_MODEL_SELECT_START_EPOCH", env_int("KAN_PINN_PRETRAIN_EPOCHS", 1000) + 1),
+        model_select_start_epoch=env_int("KAN_PINN_MODEL_SELECT_START_EPOCH", env_int("KAN_PINN_PRETRAIN_EPOCHS", 1500) + 1),
         model_select_pde_weight_floor=env_float("KAN_PINN_MODEL_SELECT_PDE_FLOOR", 1.0),
         train_pde_chunk_size=env_int("KAN_PINN_TRAIN_PDE_CHUNK", 256),
         val_pde_chunk_size=env_int("KAN_PINN_VAL_PDE_CHUNK", 256),
@@ -1466,8 +1483,8 @@ def main():
 
     mat = MaterialParams(
         mu=env_float("KAN_PINN_MU", 1.0),
-        beta=env_float("KAN_PINN_BETA", 5.0),
-        alpha=env_float("KAN_PINN_ALPHA", 2.0),
+        beta=env_float("KAN_PINN_BETA", 1.0),
+        alpha=env_float("KAN_PINN_ALPHA", 0.2),
     )
 
     geo = GeometryParams(
@@ -1495,7 +1512,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ4; natural on Γ5a/Γ5b).")
+    print("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ5).")
     print(f"Device: {device}")
 
     model = KANPINN(hidden=trn.hidden, n_basis=trn.n_basis).to(device)

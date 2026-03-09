@@ -50,3 +50,4 @@ PDE examples/results_strainlimiting_python/
 
 PDE examples/train_log.txt
 
+.venv/
