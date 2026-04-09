@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import json
 import math
 import os
 import random
@@ -33,11 +34,25 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+BOUNDARY_DISPLAY = {
+    "G1": "Γ1",
+    "G2": "Γ2",
+    "G3": "Γ3",
+    "G4": "Γ4",
+    "G5a": "Γ5a",
+    "G5b": "Γ5b",
+}
+
+OUTER_BOUNDARY_LABELS = ("G1", "G2", "G3", "G4")
+NOTCH_FACE_LABELS = ("G5a", "G5b")
+ALL_BOUNDARY_LABELS = OUTER_BOUNDARY_LABELS + NOTCH_FACE_LABELS
 
 
 # -----------------------------
@@ -77,29 +92,31 @@ class BCParams:
 class TrainParams:
     adam_epochs: int = 8000
     finetune_epochs: int = 8000
-    pretrain_epochs: int = 1500
-    pde_ramp_epochs: int = 3000
+    pretrain_epochs: int = 1000
+    pde_ramp_epochs: int = 3500
 
     n_interior_uniform: int = 256
     n_interior_refine: int = 256
-    n_interior_tip_strip: int = 2000
-    n_boundary_each: int = 64
+    n_interior_tip_strip: int = 1536
+    n_interior_tip_annulus: int = 768
+    n_boundary_each: int = 128
 
     val_n_interior_uniform: int = 256
     val_n_interior_refine: int = 256
-    val_n_interior_tip_strip: int = 4096
-    val_n_boundary_each: int = 96
+    val_n_interior_tip_strip: int = 2048
+    val_n_interior_tip_annulus: int = 1024
+    val_n_boundary_each: int = 128
 
     lambda_bc: float = 10.0
     lambda_gauge: float = 0.01
-    lambda_sym: float = 5.0
+    lambda_sym: float = 0.5
     lambda_pde: float = 1.0
-    lambda_tip: float = 0.0
-    lambda_tip_ratio: float = 0.0
+    lambda_tip: float = 0.02
+    lambda_tip_ratio: float = 1.0
 
-    tip_stress_c: float = 1.0
+    tip_stress_c: float = 0.25
     tip_stress_eps: float = 1e-5
-    tip_ratio_target: float = 1.0
+    tip_ratio_target: float = 1.2
     tip_strip_bias_power: float = 2.5
     tip_loss_r_weight_power: float = 0.5
 
@@ -114,15 +131,23 @@ class TrainParams:
     max_grad_norm: float = 1.0
 
     # Best-model selection (physics-aware)
-    model_select_start_epoch: int = 1501
-    model_select_pde_weight_floor: float = 1.0
+    model_select_start_epoch: int = 2750
+    model_select_pde_weight_floor: float = 0.25
 
     # Singular weighting w=1/(dist_to_tip+eps)
     tip_weight_eps: float = 2e-3
+    tip_weight_clip: float = 25.0
+    grad_norm_eps: float = 1e-10
+    initial_pde_weight: float = 5e-3
+    notch_face_bc_mode: str = "natural"
+    use_tip_enhanced_sampling: bool = True
 
     # Sampling around tip strip
     tip_strip_half_height: float = 0.02
     tip_strip_length: float = 0.12
+    tip_annulus_rmin: float = 2e-3
+    tip_annulus_rmax: float = 0.12
+    tip_annulus_bias_power: float = 2.0
 
     # Scheduler
     lr_gamma_adam: float = 0.9998
@@ -136,7 +161,7 @@ class TrainParams:
     adaptive_sampling: bool = False
     adaptive_candidates: int = 4096
     adaptive_topk: int = 512
-    adaptive_start_epoch: int = 200
+    adaptive_start_epoch: int = 2750
 
     # Reproducibility
     seed: int = 42
@@ -146,7 +171,14 @@ class TrainParams:
     n_basis: int = 48
 
     # PDE tip weighting control (0 = plain MSE, no singular weighting)
-    tip_weight_power: float = 0.0
+    tip_weight_power: float = 1.0
+    reference_line_tip_offset: float = 2e-3
+    tip_ratio_n_near: int = 128
+    tip_ratio_n_far: int = 128
+    tip_ratio_near_dmin: float = 8e-3
+    tip_ratio_near_dmax: float = 5e-2
+    tip_ratio_far_dmin: float = 0.18
+    tip_ratio_far_dmax: float = 0.30
 
 
 # -----------------------------
@@ -225,6 +257,38 @@ def point_in_notch_void(x: float, y: float, geo: GeometryParams) -> bool:
     return abs(y - y0) <= half_open
 
 
+def dirichlet_boundary_labels(trn: TrainParams) -> Tuple[str, ...]:
+    mode = trn.notch_face_bc_mode.strip().lower()
+    if mode == "dirichlet_zero":
+        return ALL_BOUNDARY_LABELS
+    if mode in ("natural", "exclude"):
+        return OUTER_BOUNDARY_LABELS
+    raise ValueError(
+        f"Unsupported KAN_PINN_G5_MODE='{trn.notch_face_bc_mode}'. "
+        "Use 'natural', 'exclude', or 'dirichlet_zero'."
+    )
+
+
+def boundary_roles(trn: TrainParams) -> Dict[str, str]:
+    mode = trn.notch_face_bc_mode.strip().lower()
+    roles = {label: "Dirichlet" for label in OUTER_BOUNDARY_LABELS}
+    if mode == "dirichlet_zero":
+        roles["G5a"] = "Dirichlet-zero (legacy)"
+        roles["G5b"] = "Dirichlet-zero (legacy)"
+    elif mode == "natural":
+        roles["G5a"] = "Natural / traction-free"
+        roles["G5b"] = "Natural / traction-free"
+    elif mode == "exclude":
+        roles["G5a"] = "Excluded from Dirichlet loss"
+        roles["G5b"] = "Excluded from Dirichlet loss"
+    else:
+        raise ValueError(
+            f"Unsupported KAN_PINN_G5_MODE='{trn.notch_face_bc_mode}'. "
+            "Use 'natural', 'exclude', or 'dirichlet_zero'."
+        )
+    return roles
+
+
 def sample_points_excluding_notch(
     geo: GeometryParams,
     n: int,
@@ -250,37 +314,87 @@ def sample_points_excluding_notch(
     return pts
 
 
-def sample_interior_points(geo: GeometryParams, trn: TrainParams) -> np.ndarray:
-    uniform_pts = sample_points_excluding_notch(geo, trn.n_interior_uniform)
+def sample_tip_annulus_points(geo: GeometryParams, trn: TrainParams, n: int) -> np.ndarray:
+    x0, y0 = geo.tip
+    rmin = max(1e-6, float(trn.tip_annulus_rmin))
+    rmax = max(rmin + 1e-6, float(trn.tip_annulus_rmax))
+    bias = max(1e-6, float(trn.tip_annulus_bias_power))
+
+    pts = np.empty((n, 2), dtype=np.float32)
+    k = 0
+    while k < n:
+        u = random.random()
+        r = rmin + (rmax - rmin) * ((1.0 - u) ** bias)
+        theta = -math.pi + 2.0 * math.pi * random.random()
+        x = x0 + r * math.cos(theta)
+        y = y0 + r * math.sin(theta)
+        if geo.xmin <= x <= geo.xmax and geo.ymin <= y <= geo.ymax and (not point_in_notch_void(x, y, geo)):
+            pts[k, 0] = x
+            pts[k, 1] = y
+            k += 1
+    return pts
+
+
+def sample_interior_points(
+    geo: GeometryParams,
+    trn: TrainParams,
+    counts_override: Dict[str, int] | None = None,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    counts_cfg = {
+        "uniform": trn.n_interior_uniform,
+        "refine": trn.n_interior_refine,
+        "tip_strip": trn.n_interior_tip_strip,
+        "tip_annulus": trn.n_interior_tip_annulus,
+    }
+    if counts_override is not None:
+        counts_cfg.update(counts_override)
+
+    parts: List[np.ndarray] = []
+    region_counts: Dict[str, int] = {}
+
+    uniform_pts = sample_points_excluding_notch(geo, counts_cfg["uniform"])
+    parts.append(uniform_pts)
+    region_counts["uniform"] = int(uniform_pts.shape[0])
 
     x0, y0 = geo.tip
     hr = geo.refine_half_width
     refine_pts = sample_points_excluding_notch(
         geo,
-        trn.n_interior_refine,
+        counts_cfg["refine"],
         xlo=max(geo.xmin, x0 - hr),
         xhi=min(geo.xmax, x0 + hr),
         ylo=max(geo.ymin, y0 - hr),
         yhi=min(geo.ymax, y0 + hr),
     )
+    parts.append(refine_pts)
+    region_counts["refine_box"] = int(refine_pts.shape[0])
 
-    tip_pts = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
+    if trn.use_tip_enhanced_sampling:
+        tip_pts = sample_tip_strip_points(geo, trn, counts_cfg["tip_strip"])
+        annulus_pts = sample_tip_annulus_points(geo, trn, counts_cfg["tip_annulus"])
+        parts.extend([tip_pts, annulus_pts])
+        region_counts["tip_strip"] = int(tip_pts.shape[0])
+        region_counts["tip_annulus"] = int(annulus_pts.shape[0])
+    else:
+        region_counts["tip_strip"] = 0
+        region_counts["tip_annulus"] = 0
 
-    return np.vstack([uniform_pts, refine_pts, tip_pts]).astype(np.float32)
+    points = np.vstack(parts).astype(np.float32)
+    region_counts["total"] = int(points.shape[0])
+    return points, region_counts
 
 
-def sample_interior_points_val(geo: GeometryParams, trn: TrainParams) -> np.ndarray:
-    original = (
-        trn.n_interior_uniform,
-        trn.n_interior_refine,
-        trn.n_interior_tip_strip,
+def sample_interior_points_val(geo: GeometryParams, trn: TrainParams) -> Tuple[np.ndarray, Dict[str, int]]:
+    return sample_interior_points(
+        geo,
+        trn,
+        counts_override={
+            "uniform": trn.val_n_interior_uniform,
+            "refine": trn.val_n_interior_refine,
+            "tip_strip": trn.val_n_interior_tip_strip,
+            "tip_annulus": trn.val_n_interior_tip_annulus,
+        },
     )
-    trn.n_interior_uniform = trn.val_n_interior_uniform
-    trn.n_interior_refine = trn.val_n_interior_refine
-    trn.n_interior_tip_strip = trn.val_n_interior_tip_strip
-    pts = sample_interior_points(geo, trn)
-    trn.n_interior_uniform, trn.n_interior_refine, trn.n_interior_tip_strip = original
-    return pts
 
 
 def adaptive_residual_points(
@@ -362,6 +476,26 @@ def filter_tip_strip_points(points: np.ndarray, geo: GeometryParams, trn: TrainP
     return points[mask].astype(np.float32)
 
 
+def sample_tip_ratio_line_points(
+    geo: GeometryParams,
+    trn: TrainParams,
+    n_near: int,
+    n_far: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    x0, y0 = geo.tip
+    near_lo = max(geo.xmin, x0 - max(trn.tip_ratio_near_dmax, trn.tip_ratio_near_dmin + 1e-4))
+    near_hi = max(near_lo + 1e-4, x0 - trn.tip_ratio_near_dmin)
+    far_xlo = max(geo.xmin, x0 - max(trn.tip_ratio_far_dmax, trn.tip_ratio_far_dmin + 1e-4))
+    far_xhi = max(far_xlo + 1e-4, x0 - trn.tip_ratio_far_dmin)
+    xnear = np.linspace(near_lo, near_hi, n_near, dtype=np.float32)
+    xfar = np.linspace(far_xlo, far_xhi, n_far, dtype=np.float32)
+    ynear = np.full_like(xnear, y0)
+    yfar = np.full_like(xfar, y0)
+    near_pts = np.stack([xnear, ynear], axis=1).astype(np.float32)
+    far_pts = np.stack([xfar, yfar], axis=1).astype(np.float32)
+    return near_pts, far_pts
+
+
 def notch_face_points(geo: GeometryParams, n: int) -> Tuple[np.ndarray, np.ndarray]:
     x0, y0 = geo.tip
     d1, d2 = notch_face_directions(geo)
@@ -415,15 +549,47 @@ def to_tensor(x: np.ndarray, device: torch.device, requires_grad: bool = False) 
     return t
 
 
+def safe_l2_norm(vec: torch.Tensor, eps: float) -> torch.Tensor:
+    return torch.sqrt(torch.sum(vec ** 2, dim=1) + eps)
+
+
 def phi_scalar(model: nn.Module, xy: torch.Tensor) -> torch.Tensor:
     # xy: [N,2], returns [N]
     return model(xy).squeeze(-1)
+
+
+def flux_from_grad(grad_phi: torch.Tensor, mat: MaterialParams, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    gnorm = safe_l2_norm(grad_phi, eps)
+    denom = 2.0 * mat.mu * torch.pow(1.0 + mat.beta * torch.pow(gnorm, mat.alpha), 1.0 / mat.alpha)
+    flux = grad_phi / denom.unsqueeze(1)
+    return flux, gnorm
+
+
+def boundary_normals(geo: GeometryParams, label: str, n: int) -> np.ndarray:
+    if label == "G1":
+        normal = np.array([-1.0, 0.0], dtype=np.float32)
+    elif label == "G2":
+        normal = np.array([1.0, 0.0], dtype=np.float32)
+    elif label == "G3":
+        normal = np.array([0.0, -1.0], dtype=np.float32)
+    elif label == "G4":
+        normal = np.array([0.0, 1.0], dtype=np.float32)
+    elif label == "G5a":
+        tangent, _ = notch_face_directions(geo)
+        normal = np.array([tangent[1], -tangent[0]], dtype=np.float32)
+    elif label == "G5b":
+        _, tangent = notch_face_directions(geo)
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+    else:
+        raise ValueError(f"Unknown boundary label: {label}")
+    return np.repeat(normal.reshape(1, 2), n, axis=0)
 
 
 def compute_stress(
     model: nn.Module,
     xy: torch.Tensor,
     create_graph: bool = True,
+    grad_norm_eps: float = 1e-10,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not xy.requires_grad:
         xy = xy.clone().detach().requires_grad_(True)
@@ -439,7 +605,7 @@ def compute_stress(
 
     tau_xz = grad_phi[:, 1]
     tau_yz = -grad_phi[:, 0]
-    tau_eq = torch.sqrt(tau_xz.pow(2) + tau_yz.pow(2) + 1e-12)
+    tau_eq = safe_l2_norm(torch.stack([tau_xz, tau_yz], dim=1), grad_norm_eps)
     return tau_xz, tau_yz, tau_eq
 
 
@@ -448,6 +614,7 @@ def pde_residual(
     xy: torch.Tensor,
     mat: MaterialParams,
     create_graph: bool = True,
+    grad_norm_eps: float = 1e-10,
 ) -> torch.Tensor:
     """
     Residual for Eq. 40:
@@ -465,9 +632,7 @@ def pde_residual(
         retain_graph=True,
     )[0]  # [N,2]
 
-    gnorm = torch.sqrt((grad_phi ** 2).sum(dim=1) + 1e-12)
-    denom = 2.0 * mat.mu * torch.pow(1.0 + mat.beta * torch.pow(gnorm, mat.alpha), 1.0 / mat.alpha)
-    q = grad_phi / denom.unsqueeze(1)
+    q, _ = flux_from_grad(grad_phi, mat, grad_norm_eps)
 
     qx = q[:, 0]
     qy = q[:, 1]
@@ -489,7 +654,7 @@ def pde_residual(
     return dqx_dx + dqy_dy
 
 
-def dirichlet_target(label: str, xy: torch.Tensor, bc: BCParams) -> torch.Tensor:
+def dirichlet_target(label: str, xy: torch.Tensor, bc: BCParams, trn: TrainParams) -> torch.Tensor:
     x = xy[:, 0]
     if label == "G1":
         return torch.full_like(x, bc.sigma0 * bc.L)
@@ -499,7 +664,25 @@ def dirichlet_target(label: str, xy: torch.Tensor, bc: BCParams) -> torch.Tensor
         return -bc.sigma0 * (x - bc.L)
     if label == "G4":
         return bc.sigma0 * (bc.L - x)
-    return torch.zeros_like(x)
+    if label in NOTCH_FACE_LABELS and trn.notch_face_bc_mode.strip().lower() == "dirichlet_zero":
+        return torch.zeros_like(x)
+    raise ValueError(f"Dirichlet target requested for non-Dirichlet boundary '{label}'")
+
+
+def tip_residual_weights(interior_xy: torch.Tensor, geo: GeometryParams, trn: TrainParams) -> torch.Tensor:
+    x0, y0 = geo.tip
+    dist = safe_l2_norm(
+        torch.stack([interior_xy[:, 0] - x0, interior_xy[:, 1] - y0], dim=1),
+        trn.grad_norm_eps,
+    )
+    pw = max(0.0, float(trn.tip_weight_power))
+    if pw <= 0.0:
+        return torch.ones_like(dist)
+    raw = 1.0 / (torch.pow(dist, pw) + trn.tip_weight_eps)
+    raw = raw / raw.mean().detach().clamp_min(1e-12)
+    if trn.tip_weight_clip > 0.0:
+        raw = torch.clamp(raw, max=trn.tip_weight_clip)
+    return raw
 
 
 def weighted_pde_loss(
@@ -513,28 +696,16 @@ def weighted_pde_loss(
 ) -> torch.Tensor:
     n = interior_xy.shape[0]
     if chunk_size is None or chunk_size <= 0 or chunk_size >= n:
-        res = pde_residual(model, interior_xy, mat, create_graph=create_graph)
-        x0, y0 = geo.tip
-        dist = torch.sqrt((interior_xy[:, 0] - x0) ** 2 + (interior_xy[:, 1] - y0) ** 2 + 1e-12)
-        pw = max(0.0, float(trn.tip_weight_power))
-        if pw > 0.0:
-            w = 1.0 / (torch.pow(dist, pw) + trn.tip_weight_eps)
-        else:
-            w = torch.ones_like(dist)
+        res = pde_residual(model, interior_xy, mat, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
+        w = tip_residual_weights(interior_xy, geo, trn)
         return torch.mean((w * res) ** 2)
 
-    x0, y0 = geo.tip
     total = torch.zeros((), dtype=torch.float32, device=interior_xy.device)
-    pw = max(0.0, float(trn.tip_weight_power))
     for s in range(0, n, chunk_size):
         e = min(s + chunk_size, n)
         xy_chunk = interior_xy[s:e]
-        res = pde_residual(model, xy_chunk, mat, create_graph=create_graph)
-        dist = torch.sqrt((xy_chunk[:, 0] - x0) ** 2 + (xy_chunk[:, 1] - y0) ** 2 + 1e-12)
-        if pw > 0.0:
-            w = 1.0 / (torch.pow(dist, pw) + trn.tip_weight_eps)
-        else:
-            w = torch.ones_like(dist)
+        res = pde_residual(model, xy_chunk, mat, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
+        w = tip_residual_weights(xy_chunk, geo, trn)
         chunk_loss = torch.mean((w * res) ** 2)
         total = total + chunk_loss * (e - s)
 
@@ -551,9 +722,12 @@ def tip_stress_loss(
     if tip_xy.shape[0] == 0:
         return torch.zeros((), dtype=torch.float32, device=tip_xy.device)
 
-    _, _, tau_eq = compute_stress(model, tip_xy, create_graph=create_graph)
+    _, _, tau_eq = compute_stress(model, tip_xy, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
     x0, y0 = geo.tip
-    r = torch.sqrt((tip_xy[:, 0] - x0) ** 2 + (tip_xy[:, 1] - y0) ** 2 + 1e-12)
+    r = safe_l2_norm(
+        torch.stack([tip_xy[:, 0] - x0, tip_xy[:, 1] - y0], dim=1),
+        trn.grad_norm_eps,
+    )
     singular_scaled = tau_eq * torch.sqrt(r + trn.tip_stress_eps)
     mismatch2 = (singular_scaled - trn.tip_stress_c) ** 2
     if trn.tip_loss_r_weight_power <= 0.0:
@@ -568,25 +742,17 @@ def tip_stress_ratio_loss(
     trn: TrainParams,
     device: torch.device,
     create_graph: bool = True,
-    n_near: int = 96,
-    n_far: int = 96,
+    n_near: int | None = None,
+    n_far: int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    x0, y0 = geo.tip
-    near_lo = max(geo.xmin, x0 - 0.06)
-    near_hi = x0 - 0.005
-    far_lo = geo.xmin
-    far_hi = max(geo.xmin, x0 - 0.20)
+    n_near = trn.tip_ratio_n_near if n_near is None else n_near
+    n_far = trn.tip_ratio_n_far if n_far is None else n_far
+    near_pts, far_pts = sample_tip_ratio_line_points(geo, trn, n_near, n_far)
+    near_xy = to_tensor(near_pts, device, requires_grad=True)
+    far_xy = to_tensor(far_pts, device, requires_grad=True)
 
-    xnear = torch.linspace(near_lo, near_hi, n_near, device=device)
-    xfar = torch.linspace(far_lo, far_hi, n_far, device=device)
-    ynear = torch.full_like(xnear, y0)
-    yfar = torch.full_like(xfar, y0)
-
-    near_xy = torch.stack([xnear, ynear], dim=1).requires_grad_(True)
-    far_xy = torch.stack([xfar, yfar], dim=1).requires_grad_(True)
-
-    _, _, tnear = compute_stress(model, near_xy, create_graph=create_graph)
-    _, _, tfar = compute_stress(model, far_xy, create_graph=create_graph)
+    _, _, tnear = compute_stress(model, near_xy, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
+    _, _, tfar = compute_stress(model, far_xy, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
 
     near_mean = torch.mean(tnear)
     far_mean = torch.mean(tfar)
@@ -595,16 +761,66 @@ def tip_stress_ratio_loss(
     return loss, ratio
 
 
-def boundary_loss(model: nn.Module, bdata_t: Dict[str, torch.Tensor], bc: BCParams) -> torch.Tensor:
-    losses = []
-    for label in ("G1", "G2", "G3", "G4", "G5a", "G5b"):
+def boundary_loss_terms(
+    model: nn.Module,
+    bdata_t: Dict[str, torch.Tensor],
+    bc: BCParams,
+    trn: TrainParams,
+) -> Dict[str, torch.Tensor]:
+    losses: Dict[str, torch.Tensor] = {}
+    for label in dirichlet_boundary_labels(trn):
         if label not in bdata_t:
             continue
         xy = bdata_t[label]
         pred = phi_scalar(model, xy)
-        tgt = dirichlet_target(label, xy, bc)
-        losses.append(torch.mean((pred - tgt) ** 2))
-    return torch.stack(losses).mean()
+        tgt = dirichlet_target(label, xy, bc, trn)
+        losses[label] = torch.mean((pred - tgt) ** 2)
+    return losses
+
+
+def boundary_loss(
+    model: nn.Module,
+    bdata_t: Dict[str, torch.Tensor],
+    bc: BCParams,
+    trn: TrainParams,
+) -> torch.Tensor:
+    losses = boundary_loss_terms(model, bdata_t, bc, trn)
+    if len(losses) == 0:
+        device = next(model.parameters()).device
+        return torch.zeros((), dtype=torch.float32, device=device)
+    return torch.stack(list(losses.values())).mean()
+
+
+def notch_face_flux_diagnostics(
+    model: nn.Module,
+    notch_bdata_t: Dict[str, torch.Tensor],
+    mat: MaterialParams,
+    geo: GeometryParams,
+    trn: TrainParams,
+) -> Dict[str, Dict[str, float]]:
+    diagnostics: Dict[str, Dict[str, float]] = {}
+    for label in NOTCH_FACE_LABELS:
+        xy = notch_bdata_t.get(label)
+        if xy is None or xy.shape[0] == 0:
+            diagnostics[label] = {"mean_abs_flux_n": float("nan"), "max_abs_flux_n": float("nan")}
+            continue
+        xy_req = xy.clone().detach().requires_grad_(True)
+        phi = phi_scalar(model, xy_req)
+        grad_phi = torch.autograd.grad(
+            phi,
+            xy_req,
+            grad_outputs=torch.ones_like(phi),
+            create_graph=False,
+            retain_graph=False,
+        )[0]
+        flux, _ = flux_from_grad(grad_phi, mat, trn.grad_norm_eps)
+        normals = to_tensor(boundary_normals(geo, label, xy.shape[0]), xy.device, requires_grad=False)
+        flux_n = torch.sum(flux * normals, dim=1)
+        diagnostics[label] = {
+            "mean_abs_flux_n": float(torch.mean(torch.abs(flux_n)).detach().cpu()),
+            "max_abs_flux_n": float(torch.max(torch.abs(flux_n)).detach().cpu()),
+        }
+    return diagnostics
 
 
 def gauge_loss(model: nn.Module, device: torch.device) -> torch.Tensor:
@@ -660,7 +876,7 @@ def compute_losses(
         )
     else:
         lpde = torch.zeros((), dtype=torch.float32, device=device)
-    lbc = boundary_loss(model, bdata_t, bc)
+    lbc = boundary_loss(model, bdata_t, bc, trn)
     lg = gauge_loss(model, device)
     lsym = symmetry_loss(model, geo, device)
     return lpde, lbc, lg, lsym
@@ -862,7 +1078,11 @@ def pde_curriculum_weight(epoch: int, trn: TrainParams) -> float:
     if epoch <= trn.pretrain_epochs:
         return 0.0
     phase2_epoch = epoch - trn.pretrain_epochs
-    return min(1.0, phase2_epoch / max(1, trn.pde_ramp_epochs))
+    start = min(1.0, max(0.0, trn.initial_pde_weight))
+    if trn.pde_ramp_epochs <= 0:
+        return 1.0
+    ramp = min(1.0, phase2_epoch / max(1, trn.pde_ramp_epochs))
+    return start + (1.0 - start) * ramp
 
 
 # -----------------------------
@@ -897,13 +1117,13 @@ def grad_mag(model: nn.Module, xy: torch.Tensor) -> torch.Tensor:
         create_graph=False,
         retain_graph=False,
     )[0]
-    return torch.sqrt((g ** 2).sum(dim=1) + 1e-12)
+    return safe_l2_norm(g, 1e-10)
 
 
 def residual_statistics(model: nn.Module, mat: MaterialParams, geo: GeometryParams, device: torch.device, n: int = 512):
     pts = sample_points_excluding_notch(geo, n)
     xy = to_tensor(pts, device, requires_grad=True)
-    r = pde_residual(model, xy, mat).detach().cpu().numpy()
+    r = pde_residual(model, xy, mat, grad_norm_eps=1e-10).detach().cpu().numpy()
     abs_r = np.abs(r)
     return {
         "mean_abs": float(abs_r.mean()),
@@ -942,16 +1162,10 @@ def symmetry_error(model: nn.Module, geo: GeometryParams, device: torch.device, 
     }
 
 
-def tip_gradient_indicator(model: nn.Module, geo: GeometryParams, device: torch.device):
-    x0, y0 = geo.tip
-
-    xnear = np.linspace(max(geo.xmin, x0 - 0.06), x0 - 0.005, 80, dtype=np.float32)
-    xfar = np.linspace(geo.xmin, max(geo.xmin, x0 - 0.20), 80, dtype=np.float32)
-    ynear = np.full_like(xnear, y0)
-    yfar = np.full_like(xfar, y0)
-
-    near_t = to_tensor(np.stack([xnear, ynear], axis=1), device, requires_grad=True)
-    far_t = to_tensor(np.stack([xfar, yfar], axis=1), device, requires_grad=True)
+def tip_gradient_indicator(model: nn.Module, geo: GeometryParams, trn: TrainParams, device: torch.device):
+    near_pts, far_pts = sample_tip_ratio_line_points(geo, trn, trn.tip_ratio_n_near, trn.tip_ratio_n_far)
+    near_t = to_tensor(near_pts, device, requires_grad=True)
+    far_t = to_tensor(far_pts, device, requires_grad=True)
 
     _, _, tnear = compute_stress(model, near_t, create_graph=False)
     _, _, tfar = compute_stress(model, far_t, create_graph=False)
@@ -979,11 +1193,72 @@ def grid_finite_check(model: nn.Module, geo: GeometryParams, device: torch.devic
     return {"outside_total": outside_total, "bad_outside": bad_outside}
 
 
-def run_cross_verification(model: nn.Module, mat: MaterialParams, geo: GeometryParams, trn: TrainParams, device: torch.device):
+def region_statistics(
+    model: nn.Module,
+    mat: MaterialParams,
+    geo: GeometryParams,
+    trn: TrainParams,
+    device: torch.device,
+    n: int = 512,
+) -> Dict[str, Dict[str, float]]:
+    x0, _ = geo.tip
+    near_pts = sample_tip_annulus_points(geo, trn, n)
+    far_xlo = max(geo.xmin, x0 - max(trn.tip_ratio_far_dmax, trn.tip_ratio_far_dmin + 1e-4))
+    far_xhi = max(far_xlo + 1e-4, x0 - trn.tip_ratio_far_dmin)
+    far_pts = sample_points_excluding_notch(geo, n, xlo=far_xlo, xhi=far_xhi)
+    stats: Dict[str, Dict[str, float]] = {}
+    for label, pts in (("near_tip", near_pts), ("far_field", far_pts)):
+        xy = to_tensor(pts, device, requires_grad=True)
+        _, _, tau_eq = compute_stress(model, xy, create_graph=False, grad_norm_eps=trn.grad_norm_eps)
+        residual = pde_residual(model, xy, mat, create_graph=False, grad_norm_eps=trn.grad_norm_eps)
+        tau_np = tau_eq.detach().cpu().numpy()
+        res_np = np.abs(residual.detach().cpu().numpy())
+        stats[label] = {
+            "tau_eq_mean": float(tau_np.mean()),
+            "tau_eq_max": float(tau_np.max()),
+            "residual_mean_abs": float(res_np.mean()),
+            "residual_max_abs": float(res_np.max()),
+        }
+    return stats
+
+
+def boundary_diagnostics(
+    model: nn.Module,
+    bdata_t: Dict[str, torch.Tensor],
+    bc: BCParams,
+    mat: MaterialParams,
+    geo: GeometryParams,
+    trn: TrainParams,
+) -> Dict[str, Dict[str, float]]:
+    losses = boundary_loss_terms(model, bdata_t, bc, trn)
+    diag: Dict[str, Dict[str, float]] = {}
+    for label in ALL_BOUNDARY_LABELS:
+        xy = bdata_t.get(label)
+        diag[label] = {
+            "count": int(0 if xy is None else xy.shape[0]),
+            "loss": float("nan"),
+        }
+        if label in losses:
+            diag[label]["loss"] = float(losses[label].detach().cpu())
+    flux_diag = notch_face_flux_diagnostics(model, bdata_t, mat, geo, trn)
+    for label, vals in flux_diag.items():
+        diag[label].update(vals)
+    return diag
+
+
+def run_cross_verification(
+    model: nn.Module,
+    mat: MaterialParams,
+    geo: GeometryParams,
+    trn: TrainParams,
+    device: torch.device,
+    boundary_diag: Dict[str, Dict[str, float]] | None = None,
+):
     rstats = residual_statistics(model, mat, geo, device)
     sstats = symmetry_error(model, geo, device)
-    tipstats = tip_gradient_indicator(model, geo, device)
+    tipstats = tip_gradient_indicator(model, geo, trn, device)
     gstats = grid_finite_check(model, geo, device)
+    region_stats = region_statistics(model, mat, geo, trn, device)
 
     print("Cross verification summary:")
     print(
@@ -1002,21 +1277,200 @@ def run_cross_verification(model: nn.Module, mat: MaterialParams, geo: GeometryP
         "  Finite check  | "
         f"bad outside notch={gstats['bad_outside']} / {gstats['outside_total']}"
     )
+    print(
+        "  Regional stats| "
+        f"near_tip τeq(mean/max)=({region_stats['near_tip']['tau_eq_mean']:.5e}, {region_stats['near_tip']['tau_eq_max']:.5e}), "
+        f"far_field τeq(mean/max)=({region_stats['far_field']['tau_eq_mean']:.5e}, {region_stats['far_field']['tau_eq_max']:.5e})"
+    )
+    print(
+        "  Regional PDE  | "
+        f"near_tip mean|max|r|=({region_stats['near_tip']['residual_mean_abs']:.5e}, {region_stats['near_tip']['residual_max_abs']:.5e}), "
+        f"far_field mean|max|r|=({region_stats['far_field']['residual_mean_abs']:.5e}, {region_stats['far_field']['residual_max_abs']:.5e})"
+    )
+    if boundary_diag is not None:
+        for label in ALL_BOUNDARY_LABELS:
+            info = boundary_diag[label]
+            msg = f"  {BOUNDARY_DISPLAY[label]:<12}| role={boundary_roles(trn)[label]}"
+            if np.isfinite(info.get("loss", float("nan"))):
+                msg += f", loss={info['loss']:.5e}"
+            if "mean_abs_flux_n" in info:
+                msg += (
+                    f", mean|q·n|={info['mean_abs_flux_n']:.5e}, "
+                    f"max|q·n|={info['max_abs_flux_n']:.5e}"
+                )
+            print(msg)
+    return {
+        "residual": rstats,
+        "symmetry": sstats,
+        "tip_ratio": tipstats,
+        "finite": gstats,
+        "regions": region_stats,
+        "boundary": boundary_diag,
+    }
 
 
 # -----------------------------
 # Plotting
 # -----------------------------
 
+def reference_line_arrays(geo: GeometryParams, trn: TrainParams, n: int = 300) -> Tuple[np.ndarray, np.ndarray]:
+    x0, y0 = geo.tip
+    x_tip = max(geo.xmin, x0 - max(1e-5, trn.reference_line_tip_offset))
+    xline = np.linspace(geo.xmin, x_tip, n, dtype=np.float32)
+    yline = np.full_like(xline, y0)
+    return xline, yline
+
+
+def field_diagnostics_on_grid(
+    model: nn.Module,
+    mat: MaterialParams,
+    geo: GeometryParams,
+    trn: TrainParams,
+    device: torch.device,
+    nx: int = 181,
+    ny: int = 181,
+    batch_size: int = 512,
+) -> Dict[str, np.ndarray]:
+    xs = np.linspace(geo.xmin, geo.xmax, nx, dtype=np.float32)
+    ys = np.linspace(geo.ymin, geo.ymax, ny, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    grid = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
+
+    phi = np.full((grid.shape[0],), np.nan, dtype=np.float32)
+    gradmag = np.full((grid.shape[0],), np.nan, dtype=np.float32)
+    tau_eq = np.full((grid.shape[0],), np.nan, dtype=np.float32)
+    residual = np.full((grid.shape[0],), np.nan, dtype=np.float32)
+
+    for s in range(0, grid.shape[0], batch_size):
+        e = min(s + batch_size, grid.shape[0])
+        batch = grid[s:e]
+        mask = np.array([not point_in_notch_void(float(x), float(y), geo) for x, y in batch], dtype=bool)
+        if not np.any(mask):
+            continue
+        batch_valid = batch[mask]
+        xy = to_tensor(batch_valid, device, requires_grad=True)
+        phi_batch = phi_scalar(model, xy)
+        _, _, tau_batch = compute_stress(model, xy, create_graph=False, grad_norm_eps=trn.grad_norm_eps)
+        res_batch = pde_residual(model, xy, mat, create_graph=False, grad_norm_eps=trn.grad_norm_eps)
+        idx = np.where(mask)[0] + s
+        phi[idx] = phi_batch.detach().cpu().numpy().astype(np.float32)
+        tau_np = tau_batch.detach().cpu().numpy().astype(np.float32)
+        tau_eq[idx] = tau_np
+        gradmag[idx] = tau_np
+        residual[idx] = res_batch.detach().cpu().numpy().astype(np.float32)
+
+    return {
+        "xs": xs,
+        "ys": ys,
+        "phi": phi.reshape(ny, nx),
+        "grad_mag": gradmag.reshape(ny, nx),
+        "tau_eq": tau_eq.reshape(ny, nx),
+        "residual": residual.reshape(ny, nx),
+    }
+
+
+def save_run_diagnostics(
+    outdir: Path,
+    trn: TrainParams,
+    geo: GeometryParams,
+    mat: MaterialParams,
+    bc: BCParams,
+    collocation_counts: Dict[str, int],
+    boundary_diag: Dict[str, Dict[str, float]],
+    verification: Dict[str, object],
+    fields: Dict[str, np.ndarray],
+    reference_line: Dict[str, np.ndarray],
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        outdir / "field_diagnostics.npz",
+        xs=fields["xs"],
+        ys=fields["ys"],
+        phi=fields["phi"],
+        grad_mag=fields["grad_mag"],
+        tau_eq=fields["tau_eq"],
+        residual=fields["residual"],
+    )
+    np.savez_compressed(
+        outdir / "reference_line_diagnostics.npz",
+        x=reference_line["x"],
+        y=reference_line["y"],
+        distance_to_tip=reference_line["distance_to_tip"],
+        tau_eq=reference_line["tau_eq"],
+        grad_mag=reference_line["grad_mag"],
+    )
+
+    ref_csv = outdir / "reference_line_tau_eq.csv"
+    with ref_csv.open("w", encoding="utf-8") as fh:
+        fh.write("x,y,distance_to_tip,tau_eq,grad_mag\n")
+        for x, y, d, tau, grad in zip(
+            reference_line["x"],
+            reference_line["y"],
+            reference_line["distance_to_tip"],
+            reference_line["tau_eq"],
+            reference_line["grad_mag"],
+        ):
+            fh.write(f"{x:.8f},{y:.8f},{d:.8f},{tau:.8e},{grad:.8e}\n")
+
+    summary = {
+        "boundary_roles": boundary_roles(trn),
+        "g5_mode": trn.notch_face_bc_mode,
+        "training": {
+            "adam_epochs": trn.adam_epochs,
+            "finetune_epochs": trn.finetune_epochs,
+            "pretrain_epochs": trn.pretrain_epochs,
+            "pde_ramp_epochs": trn.pde_ramp_epochs,
+            "lambda_bc": trn.lambda_bc,
+            "lambda_pde": trn.lambda_pde,
+            "lambda_tip": trn.lambda_tip,
+            "lambda_tip_ratio": trn.lambda_tip_ratio,
+            "tip_stress_c": trn.tip_stress_c,
+            "tip_ratio_target": trn.tip_ratio_target,
+            "initial_pde_weight": trn.initial_pde_weight,
+            "model_select_start_epoch": trn.model_select_start_epoch,
+            "model_select_pde_weight_floor": trn.model_select_pde_weight_floor,
+            "adaptive_sampling": trn.adaptive_sampling,
+            "adaptive_start_epoch": trn.adaptive_start_epoch,
+            "tip_ratio_n_near": trn.tip_ratio_n_near,
+            "tip_ratio_n_far": trn.tip_ratio_n_far,
+            "tip_ratio_near_dmin": trn.tip_ratio_near_dmin,
+            "tip_ratio_near_dmax": trn.tip_ratio_near_dmax,
+            "tip_ratio_far_dmin": trn.tip_ratio_far_dmin,
+            "tip_ratio_far_dmax": trn.tip_ratio_far_dmax,
+        },
+        "collocation_counts": collocation_counts,
+        "material": {"mu": mat.mu, "beta": mat.beta, "alpha": mat.alpha},
+        "geometry": {
+            "xmin": geo.xmin,
+            "xmax": geo.xmax,
+            "ymin": geo.ymin,
+            "ymax": geo.ymax,
+            "tip": list(geo.tip),
+            "notch_angle_deg": geo.notch_angle_deg,
+            "notch_length": geo.notch_length,
+        },
+        "boundary_conditions": {"sigma0": bc.sigma0, "L": bc.L},
+        "boundary_diagnostics": boundary_diag,
+        "verification": verification,
+    }
+    (outdir / "run_diagnostics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
 def save_plots(
     model: nn.Module,
+    mat: MaterialParams,
+    bc: BCParams,
     loss_hist: list[float],
     pde_hist: list[float],
     bc_hist: list[float],
     val_hist: list[float],
     geo: GeometryParams,
+    trn: TrainParams,
     outdir: Path,
     device: torch.device,
+    boundary_diag: Dict[str, Dict[str, float]],
+    collocation_counts: Dict[str, int],
+    verification: Dict[str, object],
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -1040,8 +1494,12 @@ def save_plots(
     plt.savefig(outdir / "loss_history.png", dpi=160)
     plt.close()
 
+    fields = field_diagnostics_on_grid(model, mat, geo, trn, device, nx=181, ny=181)
+    xs = fields["xs"]
+    ys = fields["ys"]
+    phi = fields["phi"]
+
     # Phi field
-    xs, ys, phi = field_on_grid(model, geo, device, nx=181, ny=181)
     plt.figure(figsize=(6, 5))
     plt.imshow(
         phi,
@@ -1058,12 +1516,32 @@ def save_plots(
     plt.savefig(outdir / "phi_field.png", dpi=160)
     plt.close()
 
+    def plot_field(field: np.ndarray, title: str, label: str, filename: str, cmap: str = "turbo") -> None:
+        plt.figure(figsize=(6, 5))
+        plt.imshow(
+            field,
+            origin="lower",
+            extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+            aspect="auto",
+            cmap=cmap,
+        )
+        plt.colorbar(label=label)
+        plt.xlabel("x")
+        plt.ylabel("y")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(outdir / filename, dpi=160)
+        plt.close()
+
+    plot_field(fields["grad_mag"], "|∇Φ| field", "|∇Φ|", "grad_phi_field.png")
+    plot_field(fields["tau_eq"], "Equivalent stress field", "τ_eq", "tau_eq_field.png")
+    plot_field(fields["residual"], "PDE residual field", "Residual", "pde_residual_field.png", cmap="coolwarm")
+
     # tau_eq approaching tip along y=y0
     x0, y0 = geo.tip
-    xline = np.linspace(geo.xmin, x0, 300, dtype=np.float32)
-    yline = np.full_like(xline, y0)
+    xline, yline = reference_line_arrays(geo, trn, n=300)
     xy = to_tensor(np.stack([xline, yline], axis=1), device, requires_grad=True)
-    _, _, tau_eq_line = compute_stress(model, xy, create_graph=False)
+    _, _, tau_eq_line = compute_stress(model, xy, create_graph=False, grad_norm_eps=trn.grad_norm_eps)
     gline = tau_eq_line.detach().cpu().numpy()
     dist_to_tip = x0 - xline
 
@@ -1075,6 +1553,15 @@ def save_plots(
     plt.tight_layout()
     plt.savefig(outdir / "tau_eq_reference_line.png", dpi=160)
     plt.close()
+
+    reference_line = {
+        "x": xline,
+        "y": yline,
+        "distance_to_tip": dist_to_tip,
+        "tau_eq": gline,
+        "grad_mag": gline.copy(),
+    }
+    save_run_diagnostics(outdir, trn, geo, mat, bc, collocation_counts, boundary_diag, verification, fields, reference_line)
 
 
 # -----------------------------
@@ -1103,11 +1590,12 @@ def train_model(
 ):
     total_epochs = trn.adam_epochs + trn.finetune_epochs
 
-    val_interior = sample_interior_points_val(geo, trn)
-    val_tip_interior = sample_tip_strip_points(geo, trn, trn.val_n_interior_tip_strip)
+    val_interior, val_collocation_counts = sample_interior_points_val(geo, trn)
+    val_tip_interior = filter_tip_strip_points(val_interior, geo, trn)
     val_bdata = sample_boundary_points(geo, trn.val_n_boundary_each)
 
     val_bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in val_bdata.items()}
+    last_collocation_counts: Dict[str, int] = {}
 
     best_state = copy.deepcopy(model.state_dict())
     best_val = float("inf")
@@ -1142,6 +1630,10 @@ def train_model(
                 "loss_val": val_hist,
                 "loss_val_select": val_select_hist,
                 "completed_epochs": len(loss_hist),
+                "boundary_roles": boundary_roles(trn),
+                "g5_mode": trn.notch_face_bc_mode,
+                "last_collocation_counts": last_collocation_counts,
+                "val_collocation_counts": val_collocation_counts,
             },
             ckpt_path,
         )
@@ -1173,7 +1665,10 @@ def train_model(
 
     if completed_epochs >= total_epochs:
         print(f"Checkpoint already reached target epochs ({completed_epochs}). Skipping training.")
-        return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist
+        return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist, {
+            "train_last": last_collocation_counts,
+            "validation": val_collocation_counts,
+        }
 
     # Stage 1: Adam
     optimizer = torch.optim.Adam(model.parameters(), lr=trn.learning_rate)
@@ -1185,29 +1680,31 @@ def train_model(
 
     for epoch in range(adam_start, trn.adam_epochs + 1):
         model.train()
-        interior = sample_interior_points(geo, trn)
-        if trn.adaptive_sampling and epoch >= trn.adaptive_start_epoch:
+        interior, collocation_counts = sample_interior_points(geo, trn)
+        collocation_counts["adaptive"] = 0
+        pde_weight = pde_curriculum_weight(epoch, trn)
+        if trn.adaptive_sampling and pde_weight > 0.0 and epoch >= trn.adaptive_start_epoch:
             try:
                 n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
                 if n_adapt > 0:
                     adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
                     if adapt_pts.size > 0:
                         interior = np.vstack([interior, adapt_pts]).astype(np.float32)
+                        collocation_counts["adaptive"] = int(adapt_pts.shape[0])
+                        collocation_counts["total"] = int(interior.shape[0])
             except RuntimeError as exc:
-                msg = str(exc).lower()
-                if "out of memory" not in msg:
-                    raise
-                print("[adaptive sampling] OOM encountered; skipping adaptive points this epoch.")
+                print(f"[adaptive sampling] RuntimeError encountered; skipping adaptive points this epoch. {exc}")
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         bdata = sample_boundary_points(geo, trn.n_boundary_each)
+        last_collocation_counts = dict(collocation_counts)
 
         bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in bdata.items()}
-        pde_weight = pde_curriculum_weight(epoch, trn)
 
         optimizer.zero_grad(set_to_none=True)
-        lbc = boundary_loss(model, bdata_t, bc)
+        bc_terms = boundary_loss_terms(model, bdata_t, bc, trn)
+        lbc = torch.stack(list(bc_terms.values())).mean()
         lg = gauge_loss(model, device)
         lsym = symmetry_loss(model, geo, device)
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
@@ -1240,12 +1737,34 @@ def train_model(
                     v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
-                v_lbc = boundary_loss(model, val_bdata_t, bc)
+                if trn.lambda_tip > 0.0 and val_tip_interior.shape[0] > 0:
+                    v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
+                else:
+                    v_ltip = torch.zeros((), dtype=torch.float32, device=device)
+                if trn.lambda_tip_ratio > 0.0:
+                    v_lratio, _ = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
+                else:
+                    v_lratio = torch.zeros((), dtype=torch.float32, device=device)
+                v_lbc = boundary_loss(model, val_bdata_t, bc, trn)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = (
+                    trn.lambda_pde * pde_weight * v_lpde
+                    + trn.lambda_tip * v_ltip
+                    + trn.lambda_tip_ratio * v_lratio
+                    + trn.lambda_bc * v_lbc
+                    + trn.lambda_gauge * v_lg
+                    + trn.lambda_sym * v_lsym
+                )
                 select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval_select = (
+                    trn.lambda_pde * select_wpde * v_lpde
+                    + trn.lambda_tip * v_ltip
+                    + trn.lambda_tip_ratio * v_lratio
+                    + trn.lambda_bc * v_lbc
+                    + trn.lambda_gauge * v_lg
+                    + trn.lambda_sym * v_lsym
+                )
             lval_f = float(lval.detach().cpu())
             lval_select_f = float(lval_select.detach().cpu())
         else:
@@ -1263,7 +1782,13 @@ def train_model(
         val_select_hist.append(lval_select_f)
 
         if do_validate:
-            if epoch >= trn.model_select_start_epoch:
+            if (not math.isfinite(best_val)) or (best_epoch == 0):
+                best_val = lval_select_f
+                best_epoch = epoch
+                stale_epochs = 0
+                best_state = copy.deepcopy(model.state_dict())
+                save_checkpoint()
+            elif epoch >= trn.model_select_start_epoch:
                 if lval_select_f < best_val - trn.min_improve:
                     best_val = lval_select_f
                     best_epoch = epoch
@@ -1285,13 +1810,18 @@ def train_model(
                 f"Epoch {epoch:5d}/{total_epochs} | "
                 f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
                 f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
+                f"Nint={collocation_counts['total']} (tip_strip={collocation_counts['tip_strip']}, "
+                f"tip_annulus={collocation_counts['tip_annulus']}, adapt={collocation_counts['adaptive']}) | "
                 f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
         if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
             print(f"Early stopping triggered at epoch {epoch}, best epoch = {best_epoch}")
             model.load_state_dict(best_state)
-            return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist
+            return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist, {
+                "train_last": last_collocation_counts,
+                "validation": val_collocation_counts,
+            }
 
     # Stage 2: Fine tune
     optimizer = torch.optim.Adam(model.parameters(), lr=trn.finetune_lr)
@@ -1303,28 +1833,30 @@ def train_model(
     for epoch in range(finetune_start, total_epochs + 1):
         model.train()
 
-        interior = sample_interior_points(geo, trn)
-        if trn.adaptive_sampling and epoch >= trn.adaptive_start_epoch:
+        interior, collocation_counts = sample_interior_points(geo, trn)
+        collocation_counts["adaptive"] = 0
+        pde_weight = pde_curriculum_weight(epoch, trn)
+        if trn.adaptive_sampling and pde_weight > 0.0 and epoch >= trn.adaptive_start_epoch:
             try:
                 n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
                 if n_adapt > 0:
                     adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
                     if adapt_pts.size > 0:
                         interior = np.vstack([interior, adapt_pts]).astype(np.float32)
+                        collocation_counts["adaptive"] = int(adapt_pts.shape[0])
+                        collocation_counts["total"] = int(interior.shape[0])
             except RuntimeError as exc:
-                msg = str(exc).lower()
-                if "out of memory" not in msg:
-                    raise
-                print("[adaptive sampling] OOM encountered; skipping adaptive points this epoch.")
+                print(f"[adaptive sampling] RuntimeError encountered; skipping adaptive points this epoch. {exc}")
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         bdata = sample_boundary_points(geo, trn.n_boundary_each)
+        last_collocation_counts = dict(collocation_counts)
         bdata_t = {kk: to_tensor(vv, device, requires_grad=False) for kk, vv in bdata.items()}
-        pde_weight = pde_curriculum_weight(epoch, trn)
 
         optimizer.zero_grad(set_to_none=True)
-        lbc = boundary_loss(model, bdata_t, bc)
+        bc_terms = boundary_loss_terms(model, bdata_t, bc, trn)
+        lbc = torch.stack(list(bc_terms.values())).mean()
         lg = gauge_loss(model, device)
         lsym = symmetry_loss(model, geo, device)
         base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
@@ -1357,12 +1889,34 @@ def train_model(
                     v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
                 else:
                     v_lpde = torch.zeros((), dtype=torch.float32, device=device)
-                v_lbc = boundary_loss(model, val_bdata_t, bc)
+                if trn.lambda_tip > 0.0 and val_tip_interior.shape[0] > 0:
+                    v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
+                else:
+                    v_ltip = torch.zeros((), dtype=torch.float32, device=device)
+                if trn.lambda_tip_ratio > 0.0:
+                    v_lratio, _ = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
+                else:
+                    v_lratio = torch.zeros((), dtype=torch.float32, device=device)
+                v_lbc = boundary_loss(model, val_bdata_t, bc, trn)
                 v_lg = gauge_loss(model, device)
                 v_lsym = symmetry_loss(model, geo, device)
-                lval = trn.lambda_pde * pde_weight * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval = (
+                    trn.lambda_pde * pde_weight * v_lpde
+                    + trn.lambda_tip * v_ltip
+                    + trn.lambda_tip_ratio * v_lratio
+                    + trn.lambda_bc * v_lbc
+                    + trn.lambda_gauge * v_lg
+                    + trn.lambda_sym * v_lsym
+                )
                 select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = trn.lambda_pde * select_wpde * v_lpde + trn.lambda_bc * v_lbc + trn.lambda_gauge * v_lg + trn.lambda_sym * v_lsym
+                lval_select = (
+                    trn.lambda_pde * select_wpde * v_lpde
+                    + trn.lambda_tip * v_ltip
+                    + trn.lambda_tip_ratio * v_lratio
+                    + trn.lambda_bc * v_lbc
+                    + trn.lambda_gauge * v_lg
+                    + trn.lambda_sym * v_lsym
+                )
             lval_f = float(lval.detach().cpu())
             lval_select_f = float(lval_select.detach().cpu())
         else:
@@ -1380,7 +1934,13 @@ def train_model(
         val_select_hist.append(lval_select_f)
 
         if do_validate:
-            if epoch >= trn.model_select_start_epoch:
+            if (not math.isfinite(best_val)) or (best_epoch == 0):
+                best_val = lval_select_f
+                best_epoch = epoch
+                stale_epochs = 0
+                best_state = copy.deepcopy(model.state_dict())
+                save_checkpoint()
+            elif epoch >= trn.model_select_start_epoch:
                 if lval_select_f < best_val - trn.min_improve:
                     best_val = lval_select_f
                     best_epoch = epoch
@@ -1402,6 +1962,8 @@ def train_model(
                 f"Epoch {epoch:5d}/{total_epochs} | "
                 f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
                 f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
+                f"Nint={collocation_counts['total']} (tip_strip={collocation_counts['tip_strip']}, "
+                f"tip_annulus={collocation_counts['tip_annulus']}, adapt={collocation_counts['adaptive']}) | "
                 f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
             )
 
@@ -1414,7 +1976,10 @@ def train_model(
 
     save_checkpoint()
 
-    return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist
+    return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist, {
+        "train_last": last_collocation_counts,
+        "validation": val_collocation_counts,
+    }
 
 
 # -----------------------------
@@ -1437,24 +2002,31 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def main():
+    default_pretrain_epochs = env_int("KAN_PINN_PRETRAIN_EPOCHS", 1000)
+    default_pde_ramp_epochs = env_int("KAN_PINN_PDE_RAMP_EPOCHS", 3500)
+    default_model_select_start = default_pretrain_epochs + max(400, default_pde_ramp_epochs // 2)
+    default_adaptive_start = default_pretrain_epochs + max(400, default_pde_ramp_epochs // 2)
+
     trn = TrainParams(
         adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 8000)),
         finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 8000),
-        pretrain_epochs=env_int("KAN_PINN_PRETRAIN_EPOCHS", 1500),
-        pde_ramp_epochs=env_int("KAN_PINN_PDE_RAMP_EPOCHS", 3000),
+        pretrain_epochs=default_pretrain_epochs,
+        pde_ramp_epochs=default_pde_ramp_epochs,
         n_interior_uniform=env_int("KAN_PINN_NU", 256),
         n_interior_refine=env_int("KAN_PINN_NR", 256),
-        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 2000),
-        n_boundary_each=env_int("KAN_PINN_NB", 64),
+        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 1536),
+        n_interior_tip_annulus=env_int("KAN_PINN_NANNULUS", 768),
+        n_boundary_each=env_int("KAN_PINN_NB", 128),
         val_n_interior_uniform=env_int("KAN_PINN_VAL_NU", 256),
         val_n_interior_refine=env_int("KAN_PINN_VAL_NR", 256),
-        val_n_interior_tip_strip=env_int("KAN_PINN_VAL_NTIP", 4096),
-        val_n_boundary_each=env_int("KAN_PINN_VAL_NB", 96),
+        val_n_interior_tip_strip=env_int("KAN_PINN_VAL_NTIP", 2048),
+        val_n_interior_tip_annulus=env_int("KAN_PINN_VAL_NANNULUS", 1024),
+        val_n_boundary_each=env_int("KAN_PINN_VAL_NB", 128),
         lambda_bc=env_float("KAN_PINN_LAMBDA_BC", 10.0),
-        lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 5.0),
+        lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 0.5),
         lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 1.0),
-        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 0.0),
-        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 0.0),
+        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 0.02),
+        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 1.0),
         learning_rate=env_float("KAN_PINN_LR", 3e-4),
         finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 5e-5),
         print_every=env_int("KAN_PINN_PRINT_EVERY", 50),
@@ -1463,22 +2035,39 @@ def main():
         early_stop_patience=env_int("KAN_PINN_PATIENCE", 99999),
         min_improve=env_float("KAN_PINN_MIN_IMPROVE", 1e-5),
         max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 1.0),
-        model_select_start_epoch=env_int("KAN_PINN_MODEL_SELECT_START_EPOCH", env_int("KAN_PINN_PRETRAIN_EPOCHS", 1500) + 1),
-        model_select_pde_weight_floor=env_float("KAN_PINN_MODEL_SELECT_PDE_FLOOR", 1.0),
+        model_select_start_epoch=env_int("KAN_PINN_MODEL_SELECT_START_EPOCH", default_model_select_start),
+        model_select_pde_weight_floor=env_float("KAN_PINN_MODEL_SELECT_PDE_FLOOR", 0.25),
         train_pde_chunk_size=env_int("KAN_PINN_TRAIN_PDE_CHUNK", 256),
         val_pde_chunk_size=env_int("KAN_PINN_VAL_PDE_CHUNK", 256),
+        tip_weight_eps=env_float("KAN_PINN_TIP_WEIGHT_EPS", 2e-3),
+        tip_weight_clip=env_float("KAN_PINN_TIP_WEIGHT_CLIP", 25.0),
+        grad_norm_eps=env_float("KAN_PINN_GRAD_NORM_EPS", 1e-10),
+        initial_pde_weight=env_float("KAN_PINN_INITIAL_PDE_WEIGHT", 5e-3),
+        notch_face_bc_mode=os.getenv("KAN_PINN_G5_MODE", "natural").strip(),
+        use_tip_enhanced_sampling=env_bool("KAN_PINN_USE_TIP_ENHANCED_SAMPLING", True),
         tip_strip_half_height=env_float("KAN_PINN_TIP_STRIP_HH", 0.02),
         tip_strip_length=env_float("KAN_PINN_TIP_STRIP_LEN", 0.12),
-        tip_stress_c=env_float("KAN_PINN_TIP_STRESS_C", 1.0),
+        tip_annulus_rmin=env_float("KAN_PINN_TIP_ANNULUS_RMIN", 2e-3),
+        tip_annulus_rmax=env_float("KAN_PINN_TIP_ANNULUS_RMAX", 0.12),
+        tip_annulus_bias_power=env_float("KAN_PINN_TIP_ANNULUS_BIAS_POWER", 2.0),
+        tip_stress_c=env_float("KAN_PINN_TIP_STRESS_C", 0.25),
         tip_stress_eps=env_float("KAN_PINN_TIP_STRESS_EPS", 1e-5),
-        tip_ratio_target=env_float("KAN_PINN_TIP_RATIO_TARGET", 1.0),
+        tip_ratio_target=env_float("KAN_PINN_TIP_RATIO_TARGET", 1.2),
         tip_strip_bias_power=env_float("KAN_PINN_TIP_STRIP_BIAS_POWER", 2.5),
         tip_loss_r_weight_power=env_float("KAN_PINN_TIP_R_WEIGHT_POWER", 0.5),
         adaptive_sampling=env_bool("KAN_PINN_ADAPTIVE_SAMPLING", False),
         adaptive_candidates=env_int("KAN_PINN_ADAPTIVE_CANDIDATES", 4096),
         adaptive_topk=env_int("KAN_PINN_ADAPTIVE_TOPK", 512),
-        adaptive_start_epoch=env_int("KAN_PINN_ADAPTIVE_START_EPOCH", 200),
+        adaptive_start_epoch=env_int("KAN_PINN_ADAPTIVE_START_EPOCH", default_adaptive_start),
         seed=env_int("KAN_PINN_SEED", 42),
+        tip_weight_power=env_float("KAN_PINN_TIP_WEIGHT_POWER", 1.0),
+        reference_line_tip_offset=env_float("KAN_PINN_REFERENCE_LINE_TIP_OFFSET", 2e-3),
+        tip_ratio_n_near=env_int("KAN_PINN_TIP_RATIO_N_NEAR", 128),
+        tip_ratio_n_far=env_int("KAN_PINN_TIP_RATIO_N_FAR", 128),
+        tip_ratio_near_dmin=env_float("KAN_PINN_TIP_RATIO_NEAR_DMIN", 8e-3),
+        tip_ratio_near_dmax=env_float("KAN_PINN_TIP_RATIO_NEAR_DMAX", 5e-2),
+        tip_ratio_far_dmin=env_float("KAN_PINN_TIP_RATIO_FAR_DMIN", 0.18),
+        tip_ratio_far_dmax=env_float("KAN_PINN_TIP_RATIO_FAR_DMAX", 0.30),
     )
 
     mat = MaterialParams(
@@ -1512,8 +2101,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ5).")
+    print("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ4).")
     print(f"Device: {device}")
+    print(f"Γ5 treatment: {boundary_roles(trn)['G5a']}")
 
     model = KANPINN(hidden=trn.hidden, n_basis=trn.n_basis).to(device)
 
@@ -1522,12 +2112,15 @@ def main():
     print(f"Run directory: {outdir}")
     print(f"Run ID: {selected_run}")
 
-    model, best_epoch, best_val, lhist, lpde_hist, lbc_hist, val_hist = train_model(
+    model, best_epoch, best_val, lhist, lpde_hist, lbc_hist, val_hist, collocation_counts = train_model(
         model, mat, geo, bc, trn, outdir, device, resume=resume_training
     )
 
-    run_cross_verification(model, mat, geo, trn, device)
-    save_plots(model, lhist, lpde_hist, lbc_hist, val_hist, geo, outdir, device)
+    final_bdata = sample_boundary_points(geo, trn.val_n_boundary_each)
+    final_bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in final_bdata.items()}
+    final_boundary_diag = boundary_diagnostics(model, final_bdata_t, bc, mat, geo, trn)
+    verification = run_cross_verification(model, mat, geo, trn, device, boundary_diag=final_boundary_diag)
+    save_plots(model, mat, bc, lhist, lpde_hist, lbc_hist, val_hist, geo, trn, outdir, device, final_boundary_diag, collocation_counts, verification)
 
     print(f"Training complete. Outputs saved in: {outdir}")
 

@@ -13,6 +13,9 @@ build/
 venv/
 env/
 ENV/
+.venv-*/
+.venv-codex/
+.venv-run/
 
 # IDE
 .vscode/
