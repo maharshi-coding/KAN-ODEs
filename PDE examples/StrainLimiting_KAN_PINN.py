@@ -8,15 +8,17 @@ div( ∇Φ / [ 2μ (1 + β |∇Φ|^α)^(1/α) ] ) = 0
 Features implemented per task:
 - Exact PDE residual via autograd (no finite differences)
 - Notched geometry sampling (rectangle minus V-notch void)
-- Dirichlet BCs on Γ1-Γ4, natural on notch faces Γ5a/Γ5b
+- Dirichlet BCs on Γ1-Γ5 with Γ5=0 on both notch faces
+- Optional distance-function hard Dirichlet ansatz
+- Nonlinear energy pretraining followed by strong-residual training
 - KAN network (Gaussian-basis Kolmogorov-Arnold layers), not an MLP
 - Weighted PDE residual near tip: w(x)=1/(dist_to_tip+eps)
-- Adam + LR schedule + grad clipping + early stopping + validation
+- Adam + LR schedule + optional L-BFGS polish + grad clipping + early stopping + validation
 - Outputs: loss plot, Φ field heatmap, |∇Φ| line plot
 - Diagnostics: PDE residual stats, symmetry, near/far gradient ratio, finite check
 
 Run example:
-  python StrainLimiting_KAN_PINN.py
+  KAN_PINN_RUN_NAME=stable_v4 python StrainLimiting_KAN_PINN.py
 
 Environment override examples:
   KAN_PINN_NTIP=256 KAN_PINN_VAL_NTIP=512 KAN_PINN_RUN_NAME=py_run python StrainLimiting_KAN_PINN.py
@@ -32,7 +34,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -90,10 +92,10 @@ class BCParams:
 
 @dataclass
 class TrainParams:
-    adam_epochs: int = 8000
-    finetune_epochs: int = 8000
-    pretrain_epochs: int = 1000
-    pde_ramp_epochs: int = 3500
+    adam_epochs: int = 10000
+    finetune_epochs: int = 5000
+    pretrain_epochs: int = 3000
+    pde_ramp_epochs: int = 9000
 
     n_interior_uniform: int = 256
     n_interior_refine: int = 256
@@ -110,9 +112,10 @@ class TrainParams:
     lambda_bc: float = 10.0
     lambda_gauge: float = 0.01
     lambda_sym: float = 0.5
-    lambda_pde: float = 1.0
-    lambda_tip: float = 0.02
-    lambda_tip_ratio: float = 1.0
+    lambda_pde: float = 0.1
+    lambda_energy: float = 1.0
+    lambda_tip: float = 0.0
+    lambda_tip_ratio: float = 0.0
 
     tip_stress_c: float = 0.25
     tip_stress_eps: float = 1e-5
@@ -120,15 +123,21 @@ class TrainParams:
     tip_strip_bias_power: float = 2.5
     tip_loss_r_weight_power: float = 0.5
 
-    learning_rate: float = 3e-4
-    finetune_lr: float = 5e-5
+    learning_rate: float = 5e-5
+    finetune_lr: float = 1e-5
 
-    print_every: int = 50
+    print_every: int = 10
     validation_every: int = 10
     checkpoint_every: int = 50
+    detailed_diag_every: int = 100
     early_stop_patience: int = 99999
     min_improve: float = 1e-5
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.25
+    diagnostics_samples: int = 512
+    pointwise_nx: int = 181
+    pointwise_ny: int = 181
+    pointwise_boundary_each: int = 256
+    pointwise_batch_size: int = 512
 
     # Best-model selection (physics-aware)
     model_select_start_epoch: int = 2750
@@ -138,8 +147,14 @@ class TrainParams:
     tip_weight_eps: float = 2e-3
     tip_weight_clip: float = 25.0
     grad_norm_eps: float = 1e-10
-    initial_pde_weight: float = 5e-3
-    notch_face_bc_mode: str = "natural"
+    initial_pde_weight: float = 1e-6
+    pde_loss_mode: str = "pseudo_huber"
+    pde_residual_delta: float = 25.0
+    notch_face_bc_mode: str = "dirichlet_zero"
+    hard_bc_mode: str = "distance_all"
+    hard_bc_eps: float = 1e-5
+    hard_bc_distance_scale: float = 0.25
+    hard_bc_distance_power: float = 2.0
     use_tip_enhanced_sampling: bool = True
 
     # Sampling around tip strip
@@ -152,6 +167,17 @@ class TrainParams:
     # Scheduler
     lr_gamma_adam: float = 0.9998
     lr_gamma_finetune: float = 0.9999
+
+    # L-BFGS polishing after Adam stages
+    lbfgs_epochs: int = 0
+    lbfgs_lr: float = 0.8
+    lbfgs_history_size: int = 25
+    lbfgs_max_iter: int = 1
+    lbfgs_n_uniform: int = 128
+    lbfgs_n_refine: int = 128
+    lbfgs_n_tip_strip: int = 384
+    lbfgs_n_tip_annulus: int = 192
+    lbfgs_n_boundary_each: int = 96
 
     # Memory control
     train_pde_chunk_size: int = 256
@@ -218,13 +244,45 @@ class KANPINN(nn.Module):
         self.k2 = KANLayer(hidden, hidden, n_basis)
         self.k3 = KANLayer(hidden, hidden, n_basis)
         self.k4 = KANLayer(hidden, 1, n_basis)
+        self.hard_bc_mode = "none"
+        self.hard_bc_eps = 1e-12
+        self.hard_bc_distance_scale = 0.15
+        self.hard_bc_distance_power = 2.0
+        self.geo: GeometryParams | None = None
+        self.bc: BCParams | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def configure_boundary_ansatz(self, geo: GeometryParams, bc: BCParams, trn: TrainParams) -> None:
+        self.geo = geo
+        self.bc = bc
+        self.hard_bc_mode = canonical_hard_bc_mode(trn.hard_bc_mode)
+        self.hard_bc_eps = trn.hard_bc_eps
+        self.hard_bc_distance_scale = trn.hard_bc_distance_scale
+        self.hard_bc_distance_power = trn.hard_bc_distance_power
+
+    def raw_forward(self, x: torch.Tensor) -> torch.Tensor:
         h = torch.tanh(self.k1(x))
         h = torch.tanh(self.k2(h))
         h = torch.tanh(self.k3(h))
         out = self.k4(h)
         return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = self.raw_forward(x).squeeze(-1)
+        if self.hard_bc_mode == "none":
+            return raw.unsqueeze(-1)
+        if self.geo is None or self.bc is None:
+            raise RuntimeError("Hard boundary ansatz requested before model.configure_boundary_ansatz(...).")
+        phi = hard_boundary_ansatz(
+            raw,
+            x,
+            self.geo,
+            self.bc,
+            self.hard_bc_mode,
+            self.hard_bc_eps,
+            self.hard_bc_distance_scale,
+            self.hard_bc_distance_power,
+        )
+        return phi.unsqueeze(-1)
 
 
 # -----------------------------
@@ -257,36 +315,107 @@ def point_in_notch_void(x: float, y: float, geo: GeometryParams) -> bool:
     return abs(y - y0) <= half_open
 
 
-def dirichlet_boundary_labels(trn: TrainParams) -> Tuple[str, ...]:
-    mode = trn.notch_face_bc_mode.strip().lower()
-    if mode == "dirichlet_zero":
-        return ALL_BOUNDARY_LABELS
-    if mode in ("natural", "exclude"):
-        return OUTER_BOUNDARY_LABELS
+def canonical_g5_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    aliases = {"dirichlet_zero", "dirichlet", "zero", "g5_dirichlet_zero"}
+    if normalized in aliases:
+        return "dirichlet_zero"
     raise ValueError(
-        f"Unsupported KAN_PINN_G5_MODE='{trn.notch_face_bc_mode}'. "
-        "Use 'natural', 'exclude', or 'dirichlet_zero'."
+        "KAN_PINN_G5_MODE must enforce Γ5 as Dirichlet zero for this formulation. "
+        f"Got '{mode}'. Supported: dirichlet_zero."
     )
 
 
+def canonical_hard_bc_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    aliases_none = {"none", "off", "false", "0", "penalty"}
+    aliases_outer = {"outer", "distance_outer", "hard_outer"}
+    aliases_all = {"all", "distance_all", "hard_all", "dirichlet_all"}
+    if normalized in aliases_none:
+        return "none"
+    if normalized in aliases_outer:
+        return "distance_outer"
+    if normalized in aliases_all:
+        return "distance_all"
+    raise ValueError(
+        f"Invalid KAN_PINN_HARD_BC_MODE='{mode}'. "
+        "Use 'distance_all', 'distance_outer', or 'none'."
+    )
+
+
+def canonical_pde_loss_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    aliases_mse = {"mse", "l2", "squared"}
+    aliases_pseudo_huber = {"pseudo_huber", "pseudohuber", "huber", "robust"}
+    if normalized in aliases_mse:
+        return "mse"
+    if normalized in aliases_pseudo_huber:
+        return "pseudo_huber"
+    raise ValueError(
+        f"Invalid KAN_PINN_PDE_LOSS_MODE='{mode}'. "
+        "Use 'pseudo_huber' for stable training or 'mse' for the raw squared residual objective."
+    )
+
+
+def dirichlet_boundary_labels(trn: TrainParams) -> Tuple[str, ...]:
+    _ = canonical_g5_mode(trn.notch_face_bc_mode)
+    return ALL_BOUNDARY_LABELS
+
+
 def boundary_roles(trn: TrainParams) -> Dict[str, str]:
-    mode = trn.notch_face_bc_mode.strip().lower()
+    _ = canonical_g5_mode(trn.notch_face_bc_mode)
     roles = {label: "Dirichlet" for label in OUTER_BOUNDARY_LABELS}
-    if mode == "dirichlet_zero":
-        roles["G5a"] = "Dirichlet-zero (legacy)"
-        roles["G5b"] = "Dirichlet-zero (legacy)"
-    elif mode == "natural":
-        roles["G5a"] = "Natural / traction-free"
-        roles["G5b"] = "Natural / traction-free"
-    elif mode == "exclude":
-        roles["G5a"] = "Excluded from Dirichlet loss"
-        roles["G5b"] = "Excluded from Dirichlet loss"
-    else:
-        raise ValueError(
-            f"Unsupported KAN_PINN_G5_MODE='{trn.notch_face_bc_mode}'. "
-            "Use 'natural', 'exclude', or 'dirichlet_zero'."
-        )
+    roles["G5a"] = "Dirichlet-zero"
+    roles["G5b"] = "Dirichlet-zero"
     return roles
+
+
+def validate_configuration(mat: MaterialParams, geo: GeometryParams, trn: TrainParams) -> None:
+    canonical_g5_mode(trn.notch_face_bc_mode)
+    canonical_hard_bc_mode(trn.hard_bc_mode)
+    canonical_pde_loss_mode(trn.pde_loss_mode)
+
+    if mat.mu <= 0.0:
+        raise ValueError(f"Invalid KAN_PINN_MU={mat.mu}. Must be > 0.")
+    if mat.beta <= 0.0:
+        raise ValueError(f"Invalid KAN_PINN_BETA={mat.beta}. Must be > 0.")
+    if mat.alpha <= 0.0:
+        raise ValueError(f"Invalid KAN_PINN_ALPHA={mat.alpha}. Must be > 0.")
+
+    if not (geo.xmin < geo.xmax and geo.ymin < geo.ymax):
+        raise ValueError("Invalid geometry bounds: require xmin < xmax and ymin < ymax.")
+    tip_x, tip_y = geo.tip
+    if not (geo.xmin <= tip_x <= geo.xmax and geo.ymin <= tip_y <= geo.ymax):
+        raise ValueError(f"Invalid notch tip={geo.tip}; tip must lie inside domain bounds.")
+    if geo.notch_length <= 0.0:
+        raise ValueError(f"Invalid notch_length={geo.notch_length}. Must be > 0.")
+    if not (0.0 < geo.notch_angle_deg < 180.0):
+        raise ValueError(f"Invalid notch_angle_deg={geo.notch_angle_deg}. Must be in (0, 180).")
+
+    if trn.adam_epochs < 0 or trn.finetune_epochs < 0:
+        raise ValueError("Training epochs must be non-negative.")
+    if trn.n_boundary_each <= 0 or trn.val_n_boundary_each <= 0:
+        raise ValueError("Boundary sample counts must be > 0.")
+    if trn.train_pde_chunk_size <= 0 or trn.val_pde_chunk_size <= 0:
+        raise ValueError("PDE chunk sizes must be > 0.")
+    if trn.diagnostics_samples <= 0:
+        raise ValueError("KAN_PINN_DIAGNOSTIC_SAMPLES must be > 0.")
+    if trn.pointwise_nx <= 1 or trn.pointwise_ny <= 1:
+        raise ValueError("KAN_PINN_POINTWISE_NX and KAN_PINN_POINTWISE_NY must be > 1.")
+    if trn.pointwise_boundary_each <= 0:
+        raise ValueError("KAN_PINN_POINTWISE_BOUNDARY_EACH must be > 0.")
+    if trn.pointwise_batch_size <= 0:
+        raise ValueError("KAN_PINN_POINTWISE_BATCH must be > 0.")
+    if trn.hard_bc_eps <= 0.0:
+        raise ValueError("KAN_PINN_HARD_BC_EPS must be > 0.")
+    if trn.hard_bc_distance_scale <= 0.0:
+        raise ValueError("KAN_PINN_HARD_BC_DISTANCE_SCALE must be > 0.")
+    if trn.hard_bc_distance_power <= 0.0:
+        raise ValueError("KAN_PINN_HARD_BC_DISTANCE_POWER must be > 0.")
+    if trn.pde_residual_delta <= 0.0:
+        raise ValueError("KAN_PINN_PDE_RESIDUAL_DELTA must be > 0.")
+    if trn.lbfgs_epochs < 0:
+        raise ValueError("KAN_PINN_LBFGS_EPOCHS must be >= 0.")
 
 
 def sample_points_excluding_notch(
@@ -585,6 +714,90 @@ def boundary_normals(geo: GeometryParams, label: str, n: int) -> np.ndarray:
     return np.repeat(normal.reshape(1, 2), n, axis=0)
 
 
+def torch_segment_distance(xy: torch.Tensor, a: Tuple[float, float], b: Tuple[float, float], eps: float) -> torch.Tensor:
+    a_t = torch.tensor(a, dtype=xy.dtype, device=xy.device)
+    b_t = torch.tensor(b, dtype=xy.dtype, device=xy.device)
+    v = b_t - a_t
+    denom = torch.sum(v * v).clamp_min(eps)
+    t = torch.sum((xy - a_t.view(1, 2)) * v.view(1, 2), dim=1) / denom
+    t = torch.clamp(t, 0.0, 1.0)
+    closest = a_t.view(1, 2) + t.view(-1, 1) * v.view(1, 2)
+    return safe_l2_norm(xy - closest, eps)
+
+
+def hard_boundary_distances(
+    xy: torch.Tensor,
+    geo: GeometryParams,
+    eps: float,
+    include_notch: bool,
+) -> Dict[str, torch.Tensor]:
+    x = xy[:, 0]
+    y = xy[:, 1]
+    distances: Dict[str, torch.Tensor] = {
+        "G1": torch.clamp(x - geo.xmin, min=0.0),
+        "G2": torch.clamp(geo.xmax - x, min=0.0),
+        "G3": torch.clamp(y - geo.ymin, min=0.0),
+        "G4": torch.clamp(geo.ymax - y, min=0.0),
+    }
+    if include_notch:
+        tip = (float(geo.tip[0]), float(geo.tip[1]))
+        pu, pl = notch_mouth_points(geo)
+        distances["G5a"] = torch_segment_distance(xy, tip, (float(pu[0]), float(pu[1])), eps)
+        distances["G5b"] = torch_segment_distance(xy, tip, (float(pl[0]), float(pl[1])), eps)
+    return distances
+
+
+def dirichlet_target_values(label: str, xy: torch.Tensor, bc: BCParams) -> torch.Tensor:
+    x = xy[:, 0]
+    if label == "G1":
+        return torch.full_like(x, bc.sigma0 * bc.L)
+    if label == "G2":
+        return torch.zeros_like(x)
+    if label == "G3":
+        return -bc.sigma0 * (x - bc.L)
+    if label == "G4":
+        return bc.sigma0 * (bc.L - x)
+    if label in NOTCH_FACE_LABELS:
+        return torch.zeros_like(x)
+    raise ValueError(f"Unknown Dirichlet boundary label: {label}")
+
+
+def hard_boundary_ansatz(
+    raw_phi: torch.Tensor,
+    xy: torch.Tensor,
+    geo: GeometryParams,
+    bc: BCParams,
+    mode: str,
+    eps: float,
+    distance_scale: float,
+    distance_power: float,
+) -> torch.Tensor:
+    """
+    Distance-based trial function Phi = G + D*N.
+
+    G is an inverse-distance Dirichlet extension. D is a smooth nearest-boundary
+    factor, so the trainable correction vanishes on prescribed boundaries.
+    """
+    mode = canonical_hard_bc_mode(mode)
+    if mode == "none":
+        return raw_phi
+
+    include_notch = mode == "distance_all"
+    distances = hard_boundary_distances(xy, geo, eps, include_notch=include_notch)
+    labels = tuple(distances.keys())
+    d_stack = torch.stack([distances[label] for label in labels], dim=1)
+    d_pos = torch.clamp(d_stack, min=0.0)
+
+    weights = 1.0 / torch.pow(d_pos + eps, distance_power)
+    target_stack = torch.stack([dirichlet_target_values(label, xy, bc) for label in labels], dim=1)
+    extension = torch.sum(weights * target_stack, dim=1) / torch.sum(weights, dim=1).clamp_min(eps)
+
+    inv_nearest = torch.sum(1.0 / (d_pos + eps), dim=1)
+    nearest = 1.0 / inv_nearest.clamp_min(eps)
+    vanish = nearest / (nearest + distance_scale)
+    return extension + vanish * raw_phi
+
+
 def compute_stress(
     model: nn.Module,
     xy: torch.Tensor,
@@ -655,18 +868,9 @@ def pde_residual(
 
 
 def dirichlet_target(label: str, xy: torch.Tensor, bc: BCParams, trn: TrainParams) -> torch.Tensor:
-    x = xy[:, 0]
-    if label == "G1":
-        return torch.full_like(x, bc.sigma0 * bc.L)
-    if label == "G2":
-        return torch.zeros_like(x)
-    if label == "G3":
-        return -bc.sigma0 * (x - bc.L)
-    if label == "G4":
-        return bc.sigma0 * (bc.L - x)
-    if label in NOTCH_FACE_LABELS and trn.notch_face_bc_mode.strip().lower() == "dirichlet_zero":
-        return torch.zeros_like(x)
-    raise ValueError(f"Dirichlet target requested for non-Dirichlet boundary '{label}'")
+    if label in NOTCH_FACE_LABELS:
+        _ = canonical_g5_mode(trn.notch_face_bc_mode)
+    return dirichlet_target_values(label, xy, bc)
 
 
 def tip_residual_weights(interior_xy: torch.Tensor, geo: GeometryParams, trn: TrainParams) -> torch.Tensor:
@@ -685,6 +889,20 @@ def tip_residual_weights(interior_xy: torch.Tensor, geo: GeometryParams, trn: Tr
     return raw
 
 
+def pde_residual_objective(weighted_residual: torch.Tensor, trn: TrainParams) -> torch.Tensor:
+    mode = canonical_pde_loss_mode(trn.pde_loss_mode)
+    if mode == "mse":
+        return weighted_residual ** 2
+
+    delta = torch.as_tensor(
+        trn.pde_residual_delta,
+        dtype=weighted_residual.dtype,
+        device=weighted_residual.device,
+    )
+    scaled = weighted_residual / delta
+    return 2.0 * delta * delta * (torch.sqrt(1.0 + scaled * scaled) - 1.0)
+
+
 def weighted_pde_loss(
     model: nn.Module,
     interior_xy: torch.Tensor,
@@ -698,7 +916,7 @@ def weighted_pde_loss(
     if chunk_size is None or chunk_size <= 0 or chunk_size >= n:
         res = pde_residual(model, interior_xy, mat, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
         w = tip_residual_weights(interior_xy, geo, trn)
-        return torch.mean((w * res) ** 2)
+        return torch.mean(pde_residual_objective(w * res, trn))
 
     total = torch.zeros((), dtype=torch.float32, device=interior_xy.device)
     for s in range(0, n, chunk_size):
@@ -706,10 +924,71 @@ def weighted_pde_loss(
         xy_chunk = interior_xy[s:e]
         res = pde_residual(model, xy_chunk, mat, create_graph=create_graph, grad_norm_eps=trn.grad_norm_eps)
         w = tip_residual_weights(xy_chunk, geo, trn)
-        chunk_loss = torch.mean((w * res) ** 2)
+        chunk_loss = torch.mean(pde_residual_objective(w * res, trn))
         total = total + chunk_loss * (e - s)
 
     return total / n
+
+
+def strain_limiting_energy_density(grad_phi: torch.Tensor, mat: MaterialParams, eps: float) -> torch.Tensor:
+    """
+    Convex potential whose gradient with respect to grad_phi is the nonlinear flux.
+    psi(s) = integral_0^s t / (2*mu*(1 + beta*t^alpha)^(1/alpha)) dt.
+    """
+    gnorm = safe_l2_norm(grad_phi, eps)
+    nodes = torch.tensor(
+        [
+            0.0198550717512319,
+            0.1016667612931866,
+            0.2372337950418355,
+            0.4082826787521751,
+            0.5917173212478249,
+            0.7627662049581645,
+            0.8983332387068134,
+            0.9801449282487681,
+        ],
+        dtype=grad_phi.dtype,
+        device=grad_phi.device,
+    )
+    weights = torch.tensor(
+        [
+            0.0506142681451881,
+            0.1111905172266872,
+            0.1568533229389436,
+            0.1813418916891809,
+            0.1813418916891809,
+            0.1568533229389436,
+            0.1111905172266872,
+            0.0506142681451881,
+        ],
+        dtype=grad_phi.dtype,
+        device=grad_phi.device,
+    )
+    t = gnorm.unsqueeze(1) * nodes.view(1, -1)
+    denom = 2.0 * mat.mu * torch.pow(1.0 + mat.beta * torch.pow(t + eps, mat.alpha), 1.0 / mat.alpha)
+    integrand = t / denom
+    return gnorm * torch.sum(weights.view(1, -1) * integrand, dim=1)
+
+
+def energy_loss(
+    model: nn.Module,
+    interior_xy: torch.Tensor,
+    mat: MaterialParams,
+    trn: TrainParams,
+    create_graph: bool = True,
+) -> torch.Tensor:
+    if not interior_xy.requires_grad:
+        interior_xy = interior_xy.clone().detach().requires_grad_(True)
+    phi = phi_scalar(model, interior_xy)
+    grad_phi = torch.autograd.grad(
+        phi,
+        interior_xy,
+        grad_outputs=torch.ones_like(phi),
+        create_graph=create_graph,
+        retain_graph=create_graph,
+    )[0]
+    density = strain_limiting_energy_density(grad_phi, mat, trn.grad_norm_eps)
+    return torch.mean(density)
 
 
 def tip_stress_loss(
@@ -980,6 +1259,86 @@ def streaming_pde_eval(
     return total / n_total
 
 
+def streaming_energy_backward(
+    model: nn.Module,
+    interior_np: np.ndarray,
+    mat: MaterialParams,
+    trn: TrainParams,
+    device: torch.device,
+    energy_weight: float,
+) -> float:
+    if energy_weight <= 0.0 or trn.lambda_energy <= 0.0:
+        return 0.0
+
+    n_total = interior_np.shape[0]
+    chunk = max(1, int(trn.train_pde_chunk_size))
+    weighted_mean = 0.0
+
+    s = 0
+    while s < n_total:
+        e = min(s + chunk, n_total)
+        try:
+            xy_chunk = to_tensor(interior_np[s:e], device, requires_grad=True)
+            lenergy_chunk = energy_loss(model, xy_chunk, mat, trn, create_graph=True)
+            frac = (e - s) / n_total
+            (trn.lambda_energy * energy_weight * frac * lenergy_chunk).backward()
+            weighted_mean += float(lenergy_chunk.detach().cpu()) * (e - s)
+            del xy_chunk, lenergy_chunk
+            s = e
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" not in msg:
+                raise
+            del exc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if chunk <= 1:
+                raise RuntimeError("CUDA OOM even at energy chunk size 1. Reduce model size/sampling.")
+            new_chunk = max(1, chunk // 2)
+            print(f"[OOM fallback] Reducing energy chunk size: {chunk} -> {new_chunk}")
+            chunk = new_chunk
+
+    return weighted_mean / n_total
+
+
+def streaming_energy_eval(
+    model: nn.Module,
+    interior_np: np.ndarray,
+    mat: MaterialParams,
+    trn: TrainParams,
+    device: torch.device,
+) -> torch.Tensor:
+    n_total = interior_np.shape[0]
+    chunk = max(1, int(trn.val_pde_chunk_size))
+    total = torch.zeros((), dtype=torch.float32, device=device)
+
+    s = 0
+    while s < n_total:
+        e = min(s + chunk, n_total)
+        try:
+            xy_chunk = to_tensor(interior_np[s:e], device, requires_grad=True)
+            lenergy_chunk = energy_loss(model, xy_chunk, mat, trn, create_graph=False)
+            total = total + lenergy_chunk * (e - s)
+            del xy_chunk, lenergy_chunk
+            s = e
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" not in msg:
+                raise
+            del exc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if chunk <= 1:
+                raise RuntimeError("CUDA OOM even at validation energy chunk size 1.")
+            new_chunk = max(1, chunk // 2)
+            print(f"[OOM fallback] Reducing val energy chunk size: {chunk} -> {new_chunk}")
+            chunk = new_chunk
+
+    return total / n_total
+
+
 def streaming_tip_stress_backward(
     model: nn.Module,
     tip_np: np.ndarray,
@@ -1083,6 +1442,12 @@ def pde_curriculum_weight(epoch: int, trn: TrainParams) -> float:
         return 1.0
     ramp = min(1.0, phase2_epoch / max(1, trn.pde_ramp_epochs))
     return start + (1.0 - start) * ramp
+
+
+def energy_curriculum_weight(epoch: int, trn: TrainParams) -> float:
+    if trn.pretrain_epochs <= 0:
+        return 0.0
+    return 1.0 if epoch <= trn.pretrain_epochs else 0.0
 
 
 # -----------------------------
@@ -1418,15 +1783,23 @@ def save_run_diagnostics(
         "training": {
             "adam_epochs": trn.adam_epochs,
             "finetune_epochs": trn.finetune_epochs,
+            "lbfgs_epochs": trn.lbfgs_epochs,
             "pretrain_epochs": trn.pretrain_epochs,
             "pde_ramp_epochs": trn.pde_ramp_epochs,
             "lambda_bc": trn.lambda_bc,
             "lambda_pde": trn.lambda_pde,
+            "lambda_energy": trn.lambda_energy,
             "lambda_tip": trn.lambda_tip,
             "lambda_tip_ratio": trn.lambda_tip_ratio,
+            "hard_bc_mode": trn.hard_bc_mode,
+            "hard_bc_eps": trn.hard_bc_eps,
+            "hard_bc_distance_scale": trn.hard_bc_distance_scale,
+            "hard_bc_distance_power": trn.hard_bc_distance_power,
             "tip_stress_c": trn.tip_stress_c,
             "tip_ratio_target": trn.tip_ratio_target,
             "initial_pde_weight": trn.initial_pde_weight,
+            "pde_loss_mode": trn.pde_loss_mode,
+            "pde_residual_delta": trn.pde_residual_delta,
             "model_select_start_epoch": trn.model_select_start_epoch,
             "model_select_pde_weight_floor": trn.model_select_pde_weight_floor,
             "adaptive_sampling": trn.adaptive_sampling,
@@ -1437,6 +1810,9 @@ def save_run_diagnostics(
             "tip_ratio_near_dmax": trn.tip_ratio_near_dmax,
             "tip_ratio_far_dmin": trn.tip_ratio_far_dmin,
             "tip_ratio_far_dmax": trn.tip_ratio_far_dmax,
+            "pointwise_nx": trn.pointwise_nx,
+            "pointwise_ny": trn.pointwise_ny,
+            "pointwise_boundary_each": trn.pointwise_boundary_each,
         },
         "collocation_counts": collocation_counts,
         "material": {"mu": mat.mu, "beta": mat.beta, "alpha": mat.alpha},
@@ -1456,12 +1832,174 @@ def save_run_diagnostics(
     (outdir / "run_diagnostics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def save_loss_history_text(
+    outdir: Path,
+    loss_hist: list[float],
+    pde_hist: list[float],
+    energy_hist: list[float],
+    bc_hist: list[float],
+    val_hist: list[float],
+) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_path = outdir / "loss_history.csv"
+    n = max(len(loss_hist), len(pde_hist), len(energy_hist), len(bc_hist), len(val_hist))
+
+    def get(values: list[float], idx: int) -> float:
+        return values[idx] if idx < len(values) else float("nan")
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        fh.write("epoch,total_loss,pde_loss,energy_loss,boundary_loss,validation_loss\n")
+        for idx in range(n):
+            fh.write(
+                f"{idx + 1},"
+                f"{get(loss_hist, idx):.10e},"
+                f"{get(pde_hist, idx):.10e},"
+                f"{get(energy_hist, idx):.10e},"
+                f"{get(bc_hist, idx):.10e},"
+                f"{get(val_hist, idx):.10e}\n"
+            )
+    return out_path
+
+
+def pointwise_quantities(
+    model: nn.Module,
+    pts_np: np.ndarray,
+    mat: MaterialParams,
+    trn: TrainParams,
+    device: torch.device,
+) -> Dict[str, np.ndarray]:
+    xy = to_tensor(pts_np, device, requires_grad=True)
+    phi = phi_scalar(model, xy)
+    grad_phi = torch.autograd.grad(
+        phi,
+        xy,
+        grad_outputs=torch.ones_like(phi),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    _, grad_norm = flux_from_grad(grad_phi, mat, trn.grad_norm_eps)
+    tau_xz = grad_phi[:, 1]
+    tau_yz = -grad_phi[:, 0]
+    tau_eq = safe_l2_norm(torch.stack([tau_xz, tau_yz], dim=1), trn.grad_norm_eps)
+    residual = pde_residual(model, xy, mat, create_graph=False, grad_norm_eps=trn.grad_norm_eps)
+    energy = strain_limiting_energy_density(grad_phi, mat, trn.grad_norm_eps)
+
+    return {
+        "phi": phi.detach().cpu().numpy().astype(np.float64),
+        "grad_norm": grad_norm.detach().cpu().numpy().astype(np.float64),
+        "tau_eq": tau_eq.detach().cpu().numpy().astype(np.float64),
+        "pde_residual": residual.detach().cpu().numpy().astype(np.float64),
+        "pde_loss": torch.square(residual).detach().cpu().numpy().astype(np.float64),
+        "energy_density": energy.detach().cpu().numpy().astype(np.float64),
+    }
+
+
+def save_pointwise_loss_text(
+    outdir: Path,
+    model: nn.Module,
+    mat: MaterialParams,
+    geo: GeometryParams,
+    bc: BCParams,
+    trn: TrainParams,
+    device: torch.device,
+) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_path = outdir / "pointwise_loss.csv"
+    xs = np.linspace(geo.xmin, geo.xmax, trn.pointwise_nx + 2, dtype=np.float32)[1:-1]
+    ys = np.linspace(geo.ymin, geo.ymax, trn.pointwise_ny + 2, dtype=np.float32)[1:-1]
+    xx, yy = np.meshgrid(xs, ys)
+    grid = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
+    interior_mask = np.array([not point_in_notch_void(float(x), float(y), geo) for x, y in grid], dtype=bool)
+    interior_pts = grid[interior_mask]
+    boundary_pts = sample_boundary_points(geo, trn.pointwise_boundary_each)
+
+    header = (
+        "point_type,boundary_label,x,y,phi,target,boundary_error,"
+        "pde_residual,pde_loss,energy_density,grad_norm,tau_eq,total_point_loss\n"
+    )
+
+    def fmt_optional(value: float | None) -> str:
+        if value is None or not math.isfinite(float(value)):
+            return "nan"
+        return f"{float(value):.10e}"
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        fh.write(header)
+
+        for s in range(0, interior_pts.shape[0], trn.pointwise_batch_size):
+            e = min(s + trn.pointwise_batch_size, interior_pts.shape[0])
+            pts = interior_pts[s:e]
+            q = pointwise_quantities(model, pts, mat, trn, device)
+            total = trn.lambda_pde * q["pde_loss"] + trn.lambda_energy * q["energy_density"]
+            for i, (x, y) in enumerate(pts):
+                fh.write(
+                    "interior,,"
+                    f"{float(x):.10e},{float(y):.10e},"
+                    f"{q['phi'][i]:.10e},nan,nan,"
+                    f"{q['pde_residual'][i]:.10e},{q['pde_loss'][i]:.10e},"
+                    f"{q['energy_density'][i]:.10e},{q['grad_norm'][i]:.10e},"
+                    f"{q['tau_eq'][i]:.10e},{total[i]:.10e}\n"
+                )
+
+        for label in ALL_BOUNDARY_LABELS:
+            pts = np.asarray(boundary_pts[label], dtype=np.float32)
+            for s in range(0, pts.shape[0], trn.pointwise_batch_size):
+                e = min(s + trn.pointwise_batch_size, pts.shape[0])
+                batch = pts[s:e]
+                xy = to_tensor(batch, device, requires_grad=False)
+                with torch.no_grad():
+                    phi = phi_scalar(model, xy).detach().cpu().numpy().astype(np.float64)
+                target = dirichlet_target(label, xy, bc, trn).detach().cpu().numpy().astype(np.float64)
+                boundary_error = phi - target
+                boundary_loss = np.square(boundary_error)
+                total = trn.lambda_bc * boundary_loss
+                for i, (x, y) in enumerate(batch):
+                    fh.write(
+                        f"boundary,{label},"
+                        f"{float(x):.10e},{float(y):.10e},"
+                        f"{phi[i]:.10e},{target[i]:.10e},{boundary_error[i]:.10e},"
+                        "nan,nan,nan,nan,nan,"
+                        f"{fmt_optional(total[i])}\n"
+                    )
+
+    return out_path
+
+
+@torch.no_grad()
+def save_boundary_points_text(
+    outdir: Path,
+    bdata: Dict[str, np.ndarray],
+    model: nn.Module,
+    bc: BCParams,
+    trn: TrainParams,
+    device: torch.device,
+    source: str,
+) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_path = outdir / "boundary_points_training.txt"
+    with out_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"# source={source}\n")
+        fh.write("boundary_label,x,y,phi_pred,phi_target,abs_error\n")
+        for label in ALL_BOUNDARY_LABELS:
+            pts = bdata.get(label)
+            if pts is None or pts.size == 0:
+                continue
+            pts_np = np.asarray(pts, dtype=np.float32)
+            xy = to_tensor(pts_np, device, requires_grad=False)
+            pred = phi_scalar(model, xy).detach().cpu().numpy()
+            tgt = dirichlet_target(label, xy, bc, trn).detach().cpu().numpy()
+            for (x, y), p, t in zip(pts_np, pred, tgt):
+                fh.write(f"{label},{x:.8f},{y:.8f},{p:.8e},{t:.8e},{abs(float(p - t)):.8e}\n")
+    return out_path
+
+
 def save_plots(
     model: nn.Module,
     mat: MaterialParams,
     bc: BCParams,
     loss_hist: list[float],
     pde_hist: list[float],
+    energy_hist: list[float],
     bc_hist: list[float],
     val_hist: list[float],
     geo: GeometryParams,
@@ -1477,11 +2015,17 @@ def save_plots(
     import matplotlib.pyplot as plt
 
     outdir.mkdir(parents=True, exist_ok=True)
+    loss_csv = save_loss_history_text(outdir, loss_hist, pde_hist, energy_hist, bc_hist, val_hist)
+    print(f"Loss history saved in: {loss_csv}")
+    pointwise_csv = save_pointwise_loss_text(outdir, model, mat, geo, bc, trn, device)
+    print(f"Pointwise loss saved in: {pointwise_csv}")
 
     # Loss history
     plt.figure(figsize=(8, 5))
     plt.plot(loss_hist, lw=2, label="L total")
     plt.plot(pde_hist, lw=2, label="L_pde")
+    if len(energy_hist) > 0:
+        plt.plot(energy_hist, lw=2, label="L_energy")
     plt.plot(bc_hist, lw=2, label="L_bc")
     if len(val_hist) > 0:
         plt.plot(val_hist, lw=2, label="L_val")
@@ -1578,6 +2122,33 @@ def get_run_outdir(root_outdir: Path, run_name: str | None = None) -> Tuple[Path
     return outdir, run_name
 
 
+def current_lr(optimizer: torch.optim.Optimizer) -> float:
+    if len(optimizer.param_groups) == 0:
+        return float("nan")
+    return float(optimizer.param_groups[0].get("lr", float("nan")))
+
+
+def format_bc_loss_line(bc_loss_values: Dict[str, float]) -> str:
+    parts: List[str] = []
+    for label in ALL_BOUNDARY_LABELS:
+        val = bc_loss_values.get(label, float("nan"))
+        if math.isfinite(val):
+            parts.append(f"{BOUNDARY_DISPLAY[label]}={val:.2e}")
+        else:
+            parts.append(f"{BOUNDARY_DISPLAY[label]}=nan")
+    return ", ".join(parts)
+
+
+def maybe_float(tensor_val: torch.Tensor | float) -> float:
+    if isinstance(tensor_val, float):
+        return tensor_val
+    return float(tensor_val.detach().cpu())
+
+
+def all_finite(values: Dict[str, float]) -> bool:
+    return all(math.isfinite(float(v)) for v in values.values())
+
+
 def train_model(
     model: nn.Module,
     mat: MaterialParams,
@@ -1588,398 +2159,607 @@ def train_model(
     device: torch.device,
     resume: bool = False,
 ):
-    total_epochs = trn.adam_epochs + trn.finetune_epochs
+    total_epochs = trn.adam_epochs + trn.finetune_epochs + trn.lbfgs_epochs
 
     val_interior, val_collocation_counts = sample_interior_points_val(geo, trn)
     val_tip_interior = filter_tip_strip_points(val_interior, geo, trn)
     val_bdata = sample_boundary_points(geo, trn.val_n_boundary_each)
-
     val_bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in val_bdata.items()}
-    last_collocation_counts: Dict[str, int] = {}
 
     best_state = copy.deepcopy(model.state_dict())
     best_val = float("inf")
     best_epoch = 0
     stale_epochs = 0
     completed_epochs = 0
+    last_collocation_counts: Dict[str, int] = {}
+    last_boundary_points: Dict[str, np.ndarray] = {}
 
     loss_hist: list[float] = []
     pde_hist: list[float] = []
+    energy_hist: list[float] = []
     bc_hist: list[float] = []
     tip_hist: list[float] = []
     tip_ratio_hist: list[float] = []
     val_hist: list[float] = []
     val_select_hist: list[float] = []
 
-    ckpt_path = outdir / "best_checkpoint.pt"
+    best_ckpt_path = outdir / "best_checkpoint.pt"
+    last_ckpt_path = outdir / "last_checkpoint.pt"
 
-    def save_checkpoint() -> None:
+    def checkpoint_payload(saved_epoch: int, reason: str) -> Dict[str, object]:
         last_state = copy.deepcopy(model.state_dict())
-        torch.save(
-            {
-                "model_state": last_state,
-                "best_model_state": best_state,
-                "last_model_state": last_state,
-                "best_epoch": best_epoch,
-                "best_val": best_val,
-                "loss_total": loss_hist,
-                "loss_pde": pde_hist,
-                "loss_bc": bc_hist,
-                "loss_tip": tip_hist,
-                "loss_tip_ratio": tip_ratio_hist,
-                "loss_val": val_hist,
-                "loss_val_select": val_select_hist,
-                "completed_epochs": len(loss_hist),
-                "boundary_roles": boundary_roles(trn),
-                "g5_mode": trn.notch_face_bc_mode,
-                "last_collocation_counts": last_collocation_counts,
-                "val_collocation_counts": val_collocation_counts,
-            },
-            ckpt_path,
-        )
+        return {
+            "model_state": last_state,
+            "last_model_state": last_state,
+            "best_model_state": copy.deepcopy(best_state),
+            "best_epoch": best_epoch,
+            "best_val": best_val,
+            "loss_total": loss_hist,
+            "loss_pde": pde_hist,
+            "loss_energy": energy_hist,
+            "loss_bc": bc_hist,
+            "loss_tip": tip_hist,
+            "loss_tip_ratio": tip_ratio_hist,
+            "loss_val": val_hist,
+            "loss_val_select": val_select_hist,
+            "completed_epochs": len(loss_hist),
+            "saved_epoch": saved_epoch,
+            "saved_reason": reason,
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "boundary_roles": boundary_roles(trn),
+            "g5_mode": trn.notch_face_bc_mode,
+            "hard_bc_mode": trn.hard_bc_mode,
+            "last_collocation_counts": last_collocation_counts,
+            "last_boundary_points": {k: v.copy() for k, v in last_boundary_points.items()},
+            "val_collocation_counts": val_collocation_counts,
+        }
 
-    if resume and ckpt_path.is_file():
-        ckpt = torch.load(ckpt_path, map_location=device)
+    def save_checkpoints(saved_epoch: int, reason: str, save_best: bool = False, verbose: bool = False) -> None:
+        payload = checkpoint_payload(saved_epoch, reason)
+        torch.save(payload, last_ckpt_path)
+        if save_best:
+            payload_best = dict(payload)
+            payload_best["checkpoint_kind"] = "best"
+            torch.save(payload_best, best_ckpt_path)
+        save_loss_history_text(outdir, loss_hist, pde_hist, energy_hist, bc_hist, val_hist)
+        if verbose:
+            best_msg = " + best_checkpoint.pt" if save_best else ""
+            print(
+                f"[checkpoint] epoch={saved_epoch} reason={reason} -> "
+                f"last_checkpoint.pt{best_msg}"
+            )
+
+    def evaluate_validation(pde_weight: float, energy_weight: float) -> Tuple[float, float]:
+        model.eval()
+        with torch.enable_grad():
+            if pde_weight > 0.0 or trn.model_select_pde_weight_floor > 0.0:
+                v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
+            else:
+                v_lpde = torch.zeros((), dtype=torch.float32, device=device)
+            if energy_weight > 0.0:
+                v_lenergy = streaming_energy_eval(model, val_interior, mat, trn, device)
+            else:
+                v_lenergy = torch.zeros((), dtype=torch.float32, device=device)
+            if trn.lambda_tip > 0.0 and val_tip_interior.shape[0] > 0:
+                v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
+            else:
+                v_ltip = torch.zeros((), dtype=torch.float32, device=device)
+            if trn.lambda_tip_ratio > 0.0:
+                v_lratio, _ = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
+            else:
+                v_lratio = torch.zeros((), dtype=torch.float32, device=device)
+            v_lbc = boundary_loss(model, val_bdata_t, bc, trn)
+            v_lg = gauge_loss(model, device)
+            v_lsym = symmetry_loss(model, geo, device)
+            lval = (
+                trn.lambda_pde * pde_weight * v_lpde
+                + trn.lambda_energy * energy_weight * v_lenergy
+                + trn.lambda_tip * v_ltip
+                + trn.lambda_tip_ratio * v_lratio
+                + trn.lambda_bc * v_lbc
+                + trn.lambda_gauge * v_lg
+                + trn.lambda_sym * v_lsym
+            )
+            select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
+            lval_select = (
+                trn.lambda_pde * select_wpde * v_lpde
+                + trn.lambda_energy * energy_weight * v_lenergy
+                + trn.lambda_tip * v_ltip
+                + trn.lambda_tip_ratio * v_lratio
+                + trn.lambda_bc * v_lbc
+                + trn.lambda_gauge * v_lg
+                + trn.lambda_sym * v_lsym
+            )
+        return maybe_float(lval), maybe_float(lval_select)
+
+    resume_source = ""
+    if resume:
+        if last_ckpt_path.is_file():
+            resume_source = str(last_ckpt_path.name)
+        elif best_ckpt_path.is_file():
+            resume_source = str(best_ckpt_path.name)
+
+    if resume_source:
+        resume_path = outdir / resume_source
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         last_state_key = "last_model_state" if "last_model_state" in ckpt else "model_state"
         best_state_key = "best_model_state" if "best_model_state" in ckpt else last_state_key
         if last_state_key in ckpt:
             model.load_state_dict(ckpt[last_state_key])
-            best_state = copy.deepcopy(ckpt[best_state_key]) if best_state_key in ckpt else copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(ckpt.get(best_state_key, ckpt[last_state_key]))
             best_epoch = int(ckpt.get("best_epoch", 0))
             best_val = float(ckpt.get("best_val", float("inf")))
             loss_hist = list(ckpt.get("loss_total", []))
             pde_hist = list(ckpt.get("loss_pde", []))
+            energy_hist = list(ckpt.get("loss_energy", [0.0] * len(loss_hist)))
             bc_hist = list(ckpt.get("loss_bc", []))
             tip_hist = list(ckpt.get("loss_tip", []))
             tip_ratio_hist = list(ckpt.get("loss_tip_ratio", []))
             val_hist = list(ckpt.get("loss_val", []))
             val_select_hist = list(ckpt.get("loss_val_select", ckpt.get("loss_val", [])))
             completed_epochs = int(ckpt.get("completed_epochs", len(loss_hist)))
+            last_collocation_counts = dict(ckpt.get("last_collocation_counts", {}))
+            loaded_boundary_points = ckpt.get("last_boundary_points", {})
+            if isinstance(loaded_boundary_points, dict):
+                last_boundary_points = {
+                    str(k): np.asarray(v, dtype=np.float32)
+                    for k, v in loaded_boundary_points.items()
+                }
             stale_epochs = 0
             print(
-                f"Resuming from checkpoint: epoch {completed_epochs}/{total_epochs} | "
-                f"best_epoch={best_epoch} best_val={best_val:.6f} (resume=last_state)"
+                f"[resume] source={resume_source} epoch={completed_epochs}/{total_epochs} "
+                f"best_epoch={best_epoch} best_val={best_val:.6e}"
             )
+    elif resume:
+        print("[resume] Requested resume but no checkpoint found; starting from scratch.")
 
     t0 = time.time()
+    session_epoch_start = max(1, completed_epochs + 1)
 
     if completed_epochs >= total_epochs:
         print(f"Checkpoint already reached target epochs ({completed_epochs}). Skipping training.")
-        return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist, {
+        if best_epoch > 0:
+            model.load_state_dict(best_state)
+        return model, best_epoch, best_val, loss_hist, pde_hist, energy_hist, bc_hist, val_hist, {
             "train_last": last_collocation_counts,
             "validation": val_collocation_counts,
+        }, last_boundary_points
+
+    def run_stage(
+        stage_name: str,
+        start_epoch: int,
+        end_epoch: int,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler,
+    ) -> bool:
+        nonlocal best_state, best_epoch, best_val, stale_epochs, last_collocation_counts, last_boundary_points
+        if start_epoch > end_epoch:
+            return False
+        print(
+            f"[stage] {stage_name}: epochs {start_epoch}..{end_epoch} | "
+            f"lr_start={current_lr(optimizer):.3e}"
+        )
+
+        for epoch in range(start_epoch, end_epoch + 1):
+            model.train()
+            interior, collocation_counts = sample_interior_points(geo, trn)
+            collocation_counts["adaptive"] = 0
+            pde_weight = pde_curriculum_weight(epoch, trn)
+            energy_weight = energy_curriculum_weight(epoch, trn)
+
+            if trn.adaptive_sampling and pde_weight > 0.0 and epoch >= trn.adaptive_start_epoch:
+                try:
+                    n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
+                    if n_adapt > 0:
+                        adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
+                        if adapt_pts.size > 0:
+                            interior = np.vstack([interior, adapt_pts]).astype(np.float32)
+                            collocation_counts["adaptive"] = int(adapt_pts.shape[0])
+                            collocation_counts["total"] = int(interior.shape[0])
+                except RuntimeError as exc:
+                    print(f"[adaptive sampling] RuntimeError; skipping adaptive points this epoch. {exc}")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            bdata = sample_boundary_points(geo, trn.n_boundary_each)
+            bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in bdata.items()}
+            last_collocation_counts = dict(collocation_counts)
+            last_boundary_points = {k: v.copy() for k, v in bdata.items()}
+
+            optimizer.zero_grad(set_to_none=True)
+            bc_terms = boundary_loss_terms(model, bdata_t, bc, trn)
+            lbc = torch.stack(list(bc_terms.values())).mean()
+            lg = gauge_loss(model, device)
+            lsym = symmetry_loss(model, geo, device)
+            base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
+            base_loss.backward()
+
+            ltip_f = 0.0
+            lratio_f = 0.0
+            lenergy_f = streaming_energy_backward(model, interior, mat, trn, device, energy_weight)
+            ratio_f = float("nan")
+            if trn.lambda_tip > 0.0:
+                tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
+                ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
+            if trn.lambda_tip_ratio > 0.0:
+                lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
+                (trn.lambda_tip_ratio * lratio_t).backward()
+                lratio_f = maybe_float(lratio_t)
+                ratio_f = maybe_float(ratio_t)
+
+            lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
+            lbc_f = maybe_float(lbc)
+            lg_f = maybe_float(lg)
+            lsym_f = maybe_float(lsym)
+            ltot_f = (
+                trn.lambda_bc * lbc_f
+                + trn.lambda_gauge * lg_f
+                + trn.lambda_sym * lsym_f
+                + trn.lambda_energy * energy_weight * lenergy_f
+                + trn.lambda_tip * ltip_f
+                + trn.lambda_tip_ratio * lratio_f
+                + trn.lambda_pde * pde_weight * lpde_f
+            )
+            loss_parts = {
+                "total": ltot_f,
+                "pde": lpde_f,
+                "energy": lenergy_f,
+                "bc": lbc_f,
+                "gauge": lg_f,
+                "sym": lsym_f,
+                "tip": ltip_f,
+                "tip_ratio": lratio_f,
+            }
+            if not all_finite(loss_parts):
+                optimizer.zero_grad(set_to_none=True)
+                print(f"[non-finite-stop] epoch={epoch} before optimizer step; losses={loss_parts}")
+                save_checkpoints(len(loss_hist), reason=f"non_finite_before_step_epoch_{epoch}", save_best=False, verbose=True)
+                return True
+
+            if trn.max_grad_norm > 0.0:
+                grad_norm = maybe_float(torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm))
+            else:
+                grad_sq = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        grad_sq += maybe_float(torch.sum(p.grad.detach() ** 2))
+                grad_norm = math.sqrt(grad_sq)
+            if not math.isfinite(grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                print(f"[non-finite-stop] epoch={epoch} non-finite gradient norm={grad_norm}")
+                save_checkpoints(len(loss_hist), reason=f"non_finite_grad_epoch_{epoch}", save_best=False, verbose=True)
+                return True
+
+            optimizer.step()
+            scheduler.step()
+            lr_now = current_lr(optimizer)
+
+            do_validate = (epoch == start_epoch) or (trn.validation_every > 0 and epoch % trn.validation_every == 0)
+            if do_validate:
+                lval_f, lval_select_f = evaluate_validation(pde_weight, energy_weight)
+            else:
+                lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
+                lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
+
+            loss_hist.append(ltot_f)
+            pde_hist.append(lpde_f)
+            energy_hist.append(lenergy_f)
+            bc_hist.append(lbc_f)
+            tip_hist.append(ltip_f)
+            tip_ratio_hist.append(lratio_f)
+            val_hist.append(lval_f)
+            val_select_hist.append(lval_select_f)
+
+            new_best = False
+            if do_validate:
+                if (not math.isfinite(best_val)) or (best_epoch == 0):
+                    best_val = lval_select_f
+                    best_epoch = epoch
+                    stale_epochs = 0
+                    best_state = copy.deepcopy(model.state_dict())
+                    new_best = True
+                elif epoch >= trn.model_select_start_epoch and lval_select_f < best_val - trn.min_improve:
+                    best_val = lval_select_f
+                    best_epoch = epoch
+                    stale_epochs = 0
+                    best_state = copy.deepcopy(model.state_dict())
+                    new_best = True
+                elif epoch >= trn.model_select_start_epoch:
+                    stale_epochs += 1
+
+            periodic_ckpt = trn.checkpoint_every > 0 and (epoch % trn.checkpoint_every == 0)
+            if new_best:
+                save_checkpoints(epoch, reason="new_best", save_best=True, verbose=True)
+            elif periodic_ckpt:
+                save_checkpoints(epoch, reason="periodic", save_best=False, verbose=True)
+
+            should_log = (epoch == start_epoch) or (trn.print_every > 0 and epoch % trn.print_every == 0)
+            if should_log:
+                elapsed = time.time() - t0
+                epochs_done_this_session = max(1, epoch - session_epoch_start + 1)
+                sec_per_epoch = elapsed / epochs_done_this_session
+                eta_s = sec_per_epoch * max(0, total_epochs - epoch)
+                best_disp = best_val if math.isfinite(best_val) else float("nan")
+                ckpt_flag = "best+last" if new_best else ("last" if periodic_ckpt else "-")
+                val_tag = "val" if do_validate else "val(skip)"
+                print(
+                    f"Epoch {epoch:5d}/{total_epochs} | L={ltot_f:.5e} | Lpde={lpde_f:.5e} | "
+                    f"Lenergy={lenergy_f:.5e} | Lbc={lbc_f:.5e} | Lg={lg_f:.5e} | Lsym={lsym_f:.5e} | "
+                    f"Ltip={ltip_f:.5e} | LtipRatio={lratio_f:.5e} (ratio={ratio_f:.3f}) | "
+                    f"Lval={lval_f:.5e} ({val_tag}) | lr={lr_now:.3e} | grad={grad_norm:.3e} | "
+                    f"wpde={pde_weight:.3f} | wE={energy_weight:.3f} | Nint={collocation_counts['total']} "
+                    f"(tip_strip={collocation_counts['tip_strip']}, tip_annulus={collocation_counts['tip_annulus']}, "
+                    f"adapt={collocation_counts['adaptive']}) | best={best_disp:.5e}@{best_epoch} | "
+                    f"new_best={'yes' if new_best else 'no'} | ckpt={ckpt_flag} | "
+                    f"elapsed={elapsed/60:.1f}m | ETA={eta_s/60:.1f}m"
+                )
+                bc_loss_values = {k: maybe_float(v) for k, v in bc_terms.items()}
+                print(f"  BC(train): {format_bc_loss_line(bc_loss_values)}")
+
+            detailed = (epoch == start_epoch) or (trn.detailed_diag_every > 0 and epoch % trn.detailed_diag_every == 0)
+            if detailed:
+                model.eval()
+                with torch.enable_grad():
+                    rstats = residual_statistics(model, mat, geo, device, n=trn.diagnostics_samples)
+                    tstats = tip_gradient_indicator(model, geo, trn, device)
+                    region = region_statistics(
+                        model,
+                        mat,
+                        geo,
+                        trn,
+                        device,
+                        n=max(64, trn.diagnostics_samples // 2),
+                    )
+                    bdiag = boundary_diagnostics(model, val_bdata_t, bc, mat, geo, trn)
+
+                print(
+                    "  Diag(PDE): "
+                    f"mean|r|={rstats['mean_abs']:.4e}, rms={rstats['rms']:.4e}, max|r|={rstats['max_abs']:.4e}"
+                )
+                print(
+                    "  Diag(Tip): "
+                    f"near={tstats['near_mean']:.4e}, far={tstats['far_mean']:.4e}, near/far={tstats['ratio']:.3f} | "
+                    f"near_tip mean|max|r|=({region['near_tip']['residual_mean_abs']:.4e}, "
+                    f"{region['near_tip']['residual_max_abs']:.4e})"
+                )
+                bdiag_losses: Dict[str, float] = {}
+                for label in ALL_BOUNDARY_LABELS:
+                    info = bdiag.get(label, {})
+                    bdiag_losses[label] = float(info.get("loss", float("nan")))
+                print(f"  Diag(BC,val): {format_bc_loss_line(bdiag_losses)}")
+                g5a_flux = bdiag["G5a"].get("mean_abs_flux_n", float("nan"))
+                g5b_flux = bdiag["G5b"].get("mean_abs_flux_n", float("nan"))
+                print(f"  Diag(Flux): Γ5a mean|q·n|={g5a_flux:.4e}, Γ5b mean|q·n|={g5b_flux:.4e}")
+
+            if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
+                print(f"[early-stop] Triggered at epoch {epoch}; best_epoch={best_epoch}")
+                return True
+
+        return False
+
+    def run_lbfgs_stage(start_epoch: int, end_epoch: int) -> bool:
+        nonlocal best_state, best_epoch, best_val, stale_epochs, last_collocation_counts, last_boundary_points
+        if start_epoch > end_epoch:
+            return False
+
+        print(
+            f"[stage] lbfgs: epochs {start_epoch}..{end_epoch} | "
+            f"lr={trn.lbfgs_lr:.3e} history={trn.lbfgs_history_size}"
+        )
+        optimizer = torch.optim.LBFGS(
+            model.parameters(),
+            lr=trn.lbfgs_lr,
+            max_iter=max(1, trn.lbfgs_max_iter),
+            history_size=max(1, trn.lbfgs_history_size),
+            line_search_fn="strong_wolfe",
+        )
+
+        counts_override = {
+            "uniform": trn.lbfgs_n_uniform,
+            "refine": trn.lbfgs_n_refine,
+            "tip_strip": trn.lbfgs_n_tip_strip,
+            "tip_annulus": trn.lbfgs_n_tip_annulus,
         }
 
-    # Stage 1: Adam
-    optimizer = torch.optim.Adam(model.parameters(), lr=trn.learning_rate)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=trn.lr_gamma_adam)
+        for epoch in range(start_epoch, end_epoch + 1):
+            model.train()
+            interior, collocation_counts = sample_interior_points(geo, trn, counts_override=counts_override)
+            collocation_counts["adaptive"] = 0
+            pde_weight = 1.0
+            energy_weight = 0.0
+            bdata = sample_boundary_points(geo, trn.lbfgs_n_boundary_each)
+            bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in bdata.items()}
+            interior_t = to_tensor(interior, device, requires_grad=True)
+            tip_interior = sample_tip_strip_points(geo, trn, max(1, trn.lbfgs_n_tip_strip))
+            tip_t = to_tensor(tip_interior, device, requires_grad=True)
+            last_collocation_counts = dict(collocation_counts)
+            last_boundary_points = {k: v.copy() for k, v in bdata.items()}
 
-    adam_start = completed_epochs + 1
-    if adam_start < 1:
-        adam_start = 1
+            closure_vals: Dict[str, float] = {}
 
-    for epoch in range(adam_start, trn.adam_epochs + 1):
-        model.train()
-        interior, collocation_counts = sample_interior_points(geo, trn)
-        collocation_counts["adaptive"] = 0
-        pde_weight = pde_curriculum_weight(epoch, trn)
-        if trn.adaptive_sampling and pde_weight > 0.0 and epoch >= trn.adaptive_start_epoch:
-            try:
-                n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
-                if n_adapt > 0:
-                    adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
-                    if adapt_pts.size > 0:
-                        interior = np.vstack([interior, adapt_pts]).astype(np.float32)
-                        collocation_counts["adaptive"] = int(adapt_pts.shape[0])
-                        collocation_counts["total"] = int(interior.shape[0])
-            except RuntimeError as exc:
-                print(f"[adaptive sampling] RuntimeError encountered; skipping adaptive points this epoch. {exc}")
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        bdata = sample_boundary_points(geo, trn.n_boundary_each)
-        last_collocation_counts = dict(collocation_counts)
-
-        bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in bdata.items()}
-
-        optimizer.zero_grad(set_to_none=True)
-        bc_terms = boundary_loss_terms(model, bdata_t, bc, trn)
-        lbc = torch.stack(list(bc_terms.values())).mean()
-        lg = gauge_loss(model, device)
-        lsym = symmetry_loss(model, geo, device)
-        base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
-        base_loss.backward()
-
-        ltip_f = 0.0
-        lratio_f = 0.0
-        ratio_f = 0.0
-        if trn.lambda_tip > 0.0:
-            tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
-            ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
-        if trn.lambda_tip_ratio > 0.0:
-            lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
-            (trn.lambda_tip_ratio * lratio_t).backward()
-            lratio_f = float(lratio_t.detach().cpu())
-            ratio_f = float(ratio_t.detach().cpu())
-        lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
-        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_tip_ratio * lratio_f + trn.lambda_pde * pde_weight * lpde_f
-
-        if trn.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
-        optimizer.step()
-        scheduler.step()
-
-        do_validate = (epoch == 1) or (trn.validation_every > 0 and epoch % trn.validation_every == 0)
-        if do_validate:
-            model.eval()
-            with torch.enable_grad():
-                if pde_weight > 0.0 or trn.model_select_pde_weight_floor > 0.0:
-                    v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
-                else:
-                    v_lpde = torch.zeros((), dtype=torch.float32, device=device)
-                if trn.lambda_tip > 0.0 and val_tip_interior.shape[0] > 0:
-                    v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
-                else:
-                    v_ltip = torch.zeros((), dtype=torch.float32, device=device)
+            def closure() -> torch.Tensor:
+                optimizer.zero_grad(set_to_none=True)
+                lpde = weighted_pde_loss(
+                    model,
+                    interior_t,
+                    mat,
+                    geo,
+                    trn,
+                    create_graph=True,
+                    chunk_size=trn.train_pde_chunk_size,
+                )
+                lbc = boundary_loss(model, bdata_t, bc, trn)
+                lg = gauge_loss(model, device)
+                lsym = symmetry_loss(model, geo, device)
+                ltip = (
+                    tip_stress_loss(model, tip_t, geo, trn, create_graph=True)
+                    if trn.lambda_tip > 0.0
+                    else torch.zeros((), dtype=torch.float32, device=device)
+                )
                 if trn.lambda_tip_ratio > 0.0:
-                    v_lratio, _ = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
+                    lratio, ratio = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
                 else:
-                    v_lratio = torch.zeros((), dtype=torch.float32, device=device)
-                v_lbc = boundary_loss(model, val_bdata_t, bc, trn)
-                v_lg = gauge_loss(model, device)
-                v_lsym = symmetry_loss(model, geo, device)
-                lval = (
-                    trn.lambda_pde * pde_weight * v_lpde
-                    + trn.lambda_tip * v_ltip
-                    + trn.lambda_tip_ratio * v_lratio
-                    + trn.lambda_bc * v_lbc
-                    + trn.lambda_gauge * v_lg
-                    + trn.lambda_sym * v_lsym
+                    lratio = torch.zeros((), dtype=torch.float32, device=device)
+                    ratio = torch.tensor(float("nan"), dtype=torch.float32, device=device)
+
+                loss = (
+                    trn.lambda_pde * pde_weight * lpde
+                    + trn.lambda_bc * lbc
+                    + trn.lambda_gauge * lg
+                    + trn.lambda_sym * lsym
+                    + trn.lambda_tip * ltip
+                    + trn.lambda_tip_ratio * lratio
                 )
-                select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = (
-                    trn.lambda_pde * select_wpde * v_lpde
-                    + trn.lambda_tip * v_ltip
-                    + trn.lambda_tip_ratio * v_lratio
-                    + trn.lambda_bc * v_lbc
-                    + trn.lambda_gauge * v_lg
-                    + trn.lambda_sym * v_lsym
+                loss.backward()
+                if trn.max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
+                closure_vals.update(
+                    {
+                        "total": maybe_float(loss),
+                        "pde": maybe_float(lpde),
+                        "bc": maybe_float(lbc),
+                        "gauge": maybe_float(lg),
+                        "sym": maybe_float(lsym),
+                        "tip": maybe_float(ltip),
+                        "tip_ratio": maybe_float(lratio),
+                        "ratio": maybe_float(ratio),
+                    }
                 )
-            lval_f = float(lval.detach().cpu())
-            lval_select_f = float(lval_select.detach().cpu())
-        else:
-            lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
-            lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
+                return loss
 
-        lbc_f = float(lbc.detach().cpu())
+            optimizer.step(closure)
 
-        loss_hist.append(ltot_f)
-        pde_hist.append(lpde_f)
-        bc_hist.append(lbc_f)
-        tip_hist.append(ltip_f)
-        tip_ratio_hist.append(lratio_f)
-        val_hist.append(lval_f)
-        val_select_hist.append(lval_select_f)
+            lpde_f = closure_vals.get("pde", float("nan"))
+            lenergy_f = 0.0
+            lbc_f = closure_vals.get("bc", float("nan"))
+            lg_f = closure_vals.get("gauge", float("nan"))
+            lsym_f = closure_vals.get("sym", float("nan"))
+            ltip_f = closure_vals.get("tip", 0.0)
+            lratio_f = closure_vals.get("tip_ratio", 0.0)
+            ratio_f = closure_vals.get("ratio", float("nan"))
+            ltot_f = closure_vals.get("total", float("nan"))
 
-        if do_validate:
-            if (not math.isfinite(best_val)) or (best_epoch == 0):
-                best_val = lval_select_f
-                best_epoch = epoch
-                stale_epochs = 0
-                best_state = copy.deepcopy(model.state_dict())
-                save_checkpoint()
-            elif epoch >= trn.model_select_start_epoch:
+            grad_sq = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_sq += maybe_float(torch.sum(p.grad.detach() ** 2))
+            grad_norm = math.sqrt(max(0.0, grad_sq))
+
+            do_validate = (epoch == start_epoch) or (trn.validation_every > 0 and epoch % trn.validation_every == 0)
+            if do_validate:
+                lval_f, lval_select_f = evaluate_validation(pde_weight, energy_weight)
+            else:
+                lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
+                lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
+
+            loss_hist.append(ltot_f)
+            pde_hist.append(lpde_f)
+            energy_hist.append(lenergy_f)
+            bc_hist.append(lbc_f)
+            tip_hist.append(ltip_f)
+            tip_ratio_hist.append(lratio_f)
+            val_hist.append(lval_f)
+            val_select_hist.append(lval_select_f)
+
+            new_best = False
+            if do_validate:
                 if lval_select_f < best_val - trn.min_improve:
                     best_val = lval_select_f
                     best_epoch = epoch
                     stale_epochs = 0
                     best_state = copy.deepcopy(model.state_dict())
-                    save_checkpoint()
+                    new_best = True
                 else:
                     stale_epochs += 1
 
-        if trn.checkpoint_every > 0 and (epoch % trn.checkpoint_every == 0):
-            save_checkpoint()
+            periodic_ckpt = trn.checkpoint_every > 0 and (epoch % trn.checkpoint_every == 0)
+            if new_best:
+                save_checkpoints(epoch, reason="new_best_lbfgs", save_best=True, verbose=True)
+            elif periodic_ckpt:
+                save_checkpoints(epoch, reason="periodic_lbfgs", save_best=False, verbose=True)
 
-        if epoch == 1 or (epoch % trn.print_every == 0):
-            elapsed = time.time() - t0
-            sec_per_ep = elapsed / epoch
-            eta = sec_per_ep * (total_epochs - epoch)
-            val_tag = "val" if do_validate else "val(skip)"
-            print(
-                f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
-                f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
-                f"Nint={collocation_counts['total']} (tip_strip={collocation_counts['tip_strip']}, "
-                f"tip_annulus={collocation_counts['tip_annulus']}, adapt={collocation_counts['adaptive']}) | "
-                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
-            )
+            should_log = (epoch == start_epoch) or (trn.print_every > 0 and epoch % trn.print_every == 0)
+            if should_log:
+                elapsed = time.time() - t0
+                epochs_done_this_session = max(1, epoch - session_epoch_start + 1)
+                sec_per_epoch = elapsed / epochs_done_this_session
+                eta_s = sec_per_epoch * max(0, total_epochs - epoch)
+                best_disp = best_val if math.isfinite(best_val) else float("nan")
+                ckpt_flag = "best+last" if new_best else ("last" if periodic_ckpt else "-")
+                val_tag = "val" if do_validate else "val(skip)"
+                print(
+                    f"Epoch {epoch:5d}/{total_epochs} | L={ltot_f:.5e} | Lpde={lpde_f:.5e} | "
+                    f"Lenergy={lenergy_f:.5e} | Lbc={lbc_f:.5e} | Lg={lg_f:.5e} | Lsym={lsym_f:.5e} | "
+                    f"Ltip={ltip_f:.5e} | LtipRatio={lratio_f:.5e} (ratio={ratio_f:.3f}) | "
+                    f"Lval={lval_f:.5e} ({val_tag}) | lr={trn.lbfgs_lr:.3e} | grad={grad_norm:.3e} | "
+                    f"wpde={pde_weight:.3f} | wE={energy_weight:.3f} | Nint={collocation_counts['total']} "
+                    f"(tip_strip={collocation_counts['tip_strip']}, tip_annulus={collocation_counts['tip_annulus']}, "
+                    f"adapt={collocation_counts['adaptive']}) | best={best_disp:.5e}@{best_epoch} | "
+                    f"new_best={'yes' if new_best else 'no'} | ckpt={ckpt_flag} | "
+                    f"elapsed={elapsed/60:.1f}m | ETA={eta_s/60:.1f}m"
+                )
+                bc_terms = boundary_loss_terms(model, bdata_t, bc, trn)
+                bc_loss_values = {k: maybe_float(v) for k, v in bc_terms.items()}
+                print(f"  BC(train): {format_bc_loss_line(bc_loss_values)}")
 
-        if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
-            print(f"Early stopping triggered at epoch {epoch}, best epoch = {best_epoch}")
-            model.load_state_dict(best_state)
-            return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist, {
-                "train_last": last_collocation_counts,
-                "validation": val_collocation_counts,
-            }
+            if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
+                print(f"[early-stop] Triggered during L-BFGS at epoch {epoch}; best_epoch={best_epoch}")
+                return True
 
-    # Stage 2: Fine tune
-    optimizer = torch.optim.Adam(model.parameters(), lr=trn.finetune_lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=trn.lr_gamma_finetune)
+        return False
+
+    stopped_early = False
+
+    adam_start = max(1, completed_epochs + 1)
+    adam_end = min(trn.adam_epochs, total_epochs)
+    if adam_start <= adam_end:
+        opt_adam = torch.optim.Adam(model.parameters(), lr=trn.learning_rate)
+        sch_adam = torch.optim.lr_scheduler.ExponentialLR(opt_adam, gamma=trn.lr_gamma_adam)
+        stopped_early = run_stage("adam", adam_start, adam_end, opt_adam, sch_adam)
+    else:
+        print(f"[stage] adam skipped (start={adam_start}, end={adam_end}).")
+
     finetune_start = max(completed_epochs + 1, trn.adam_epochs + 1)
-    if finetune_start <= total_epochs:
-        print(f"Starting fine-tune stage with lower LR = {trn.finetune_lr}")
+    finetune_end = min(trn.adam_epochs + trn.finetune_epochs, total_epochs)
+    if (not stopped_early) and finetune_start <= finetune_end:
+        opt_fine = torch.optim.Adam(model.parameters(), lr=trn.finetune_lr)
+        sch_fine = torch.optim.lr_scheduler.ExponentialLR(opt_fine, gamma=trn.lr_gamma_finetune)
+        stopped_early = run_stage("finetune", finetune_start, finetune_end, opt_fine, sch_fine)
+    elif not stopped_early:
+        print(f"[stage] finetune skipped (start={finetune_start}, end={finetune_end}).")
 
-    for epoch in range(finetune_start, total_epochs + 1):
-        model.train()
+    lbfgs_start = max(completed_epochs + 1, trn.adam_epochs + trn.finetune_epochs + 1)
+    if (not stopped_early) and trn.lbfgs_epochs > 0 and lbfgs_start <= total_epochs:
+        stopped_early = run_lbfgs_stage(lbfgs_start, total_epochs)
+    elif not stopped_early and trn.lbfgs_epochs > 0:
+        print(f"[stage] lbfgs skipped (start={lbfgs_start}, end={total_epochs}).")
 
-        interior, collocation_counts = sample_interior_points(geo, trn)
-        collocation_counts["adaptive"] = 0
-        pde_weight = pde_curriculum_weight(epoch, trn)
-        if trn.adaptive_sampling and pde_weight > 0.0 and epoch >= trn.adaptive_start_epoch:
-            try:
-                n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
-                if n_adapt > 0:
-                    adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
-                    if adapt_pts.size > 0:
-                        interior = np.vstack([interior, adapt_pts]).astype(np.float32)
-                        collocation_counts["adaptive"] = int(adapt_pts.shape[0])
-                        collocation_counts["total"] = int(interior.shape[0])
-            except RuntimeError as exc:
-                print(f"[adaptive sampling] RuntimeError encountered; skipping adaptive points this epoch. {exc}")
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        bdata = sample_boundary_points(geo, trn.n_boundary_each)
-        last_collocation_counts = dict(collocation_counts)
-        bdata_t = {kk: to_tensor(vv, device, requires_grad=False) for kk, vv in bdata.items()}
-
-        optimizer.zero_grad(set_to_none=True)
-        bc_terms = boundary_loss_terms(model, bdata_t, bc, trn)
-        lbc = torch.stack(list(bc_terms.values())).mean()
-        lg = gauge_loss(model, device)
-        lsym = symmetry_loss(model, geo, device)
-        base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
-        base_loss.backward()
-
-        ltip_f = 0.0
-        lratio_f = 0.0
-        ratio_f = 0.0
-        if trn.lambda_tip > 0.0:
-            tip_interior = sample_tip_strip_points(geo, trn, trn.n_interior_tip_strip)
-            ltip_f = streaming_tip_stress_backward(model, tip_interior, geo, trn, device)
-        if trn.lambda_tip_ratio > 0.0:
-            lratio_t, ratio_t = tip_stress_ratio_loss(model, geo, trn, device, create_graph=True)
-            (trn.lambda_tip_ratio * lratio_t).backward()
-            lratio_f = float(lratio_t.detach().cpu())
-            ratio_f = float(ratio_t.detach().cpu())
-        lpde_f = streaming_pde_backward(model, interior, mat, geo, trn, device, pde_weight)
-        ltot_f = float(base_loss.detach().cpu()) + trn.lambda_tip * ltip_f + trn.lambda_tip_ratio * lratio_f + trn.lambda_pde * pde_weight * lpde_f
-
-        if trn.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), trn.max_grad_norm)
-        optimizer.step()
-        scheduler.step()
-
-        do_validate = (epoch == 1) or (trn.validation_every > 0 and epoch % trn.validation_every == 0)
-        if do_validate:
-            model.eval()
-            with torch.enable_grad():
-                if pde_weight > 0.0 or trn.model_select_pde_weight_floor > 0.0:
-                    v_lpde = streaming_pde_eval(model, val_interior, mat, geo, trn, device)
-                else:
-                    v_lpde = torch.zeros((), dtype=torch.float32, device=device)
-                if trn.lambda_tip > 0.0 and val_tip_interior.shape[0] > 0:
-                    v_ltip = streaming_tip_stress_eval(model, val_tip_interior, geo, trn, device)
-                else:
-                    v_ltip = torch.zeros((), dtype=torch.float32, device=device)
-                if trn.lambda_tip_ratio > 0.0:
-                    v_lratio, _ = tip_stress_ratio_loss(model, geo, trn, device, create_graph=False)
-                else:
-                    v_lratio = torch.zeros((), dtype=torch.float32, device=device)
-                v_lbc = boundary_loss(model, val_bdata_t, bc, trn)
-                v_lg = gauge_loss(model, device)
-                v_lsym = symmetry_loss(model, geo, device)
-                lval = (
-                    trn.lambda_pde * pde_weight * v_lpde
-                    + trn.lambda_tip * v_ltip
-                    + trn.lambda_tip_ratio * v_lratio
-                    + trn.lambda_bc * v_lbc
-                    + trn.lambda_gauge * v_lg
-                    + trn.lambda_sym * v_lsym
-                )
-                select_wpde = max(pde_weight, trn.model_select_pde_weight_floor)
-                lval_select = (
-                    trn.lambda_pde * select_wpde * v_lpde
-                    + trn.lambda_tip * v_ltip
-                    + trn.lambda_tip_ratio * v_lratio
-                    + trn.lambda_bc * v_lbc
-                    + trn.lambda_gauge * v_lg
-                    + trn.lambda_sym * v_lsym
-                )
-            lval_f = float(lval.detach().cpu())
-            lval_select_f = float(lval_select.detach().cpu())
-        else:
-            lval_f = val_hist[-1] if len(val_hist) > 0 else float("nan")
-            lval_select_f = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
-
-        lbc_f = float(lbc.detach().cpu())
-
-        loss_hist.append(ltot_f)
-        pde_hist.append(lpde_f)
-        bc_hist.append(lbc_f)
-        tip_hist.append(ltip_f)
-        tip_ratio_hist.append(lratio_f)
-        val_hist.append(lval_f)
-        val_select_hist.append(lval_select_f)
-
-        if do_validate:
-            if (not math.isfinite(best_val)) or (best_epoch == 0):
-                best_val = lval_select_f
-                best_epoch = epoch
-                stale_epochs = 0
-                best_state = copy.deepcopy(model.state_dict())
-                save_checkpoint()
-            elif epoch >= trn.model_select_start_epoch:
-                if lval_select_f < best_val - trn.min_improve:
-                    best_val = lval_select_f
-                    best_epoch = epoch
-                    stale_epochs = 0
-                    best_state = copy.deepcopy(model.state_dict())
-                    save_checkpoint()
-                else:
-                    stale_epochs += 1
-
-        if trn.checkpoint_every > 0 and (epoch % trn.checkpoint_every == 0):
-            save_checkpoint()
-
-        if epoch == 1 or (epoch % trn.print_every == 0):
-            elapsed = time.time() - t0
-            sec_per_ep = elapsed / epoch
-            eta = sec_per_ep * (total_epochs - epoch)
-            val_tag = "val" if do_validate else "val(skip)"
-            print(
-                f"Epoch {epoch:5d}/{total_epochs} | "
-                f"L={ltot_f:.5e} | Lpde={lpde_f:.5e} | Lbc={lbc_f:.5e} | "
-                f"Lval={lval_f:.5e} | Lval(sel)={lval_select_f:.5e} ({val_tag}) | "
-                f"Nint={collocation_counts['total']} (tip_strip={collocation_counts['tip_strip']}, "
-                f"tip_annulus={collocation_counts['tip_annulus']}, adapt={collocation_counts['adaptive']}) | "
-                f"wpde={pde_weight:.3f} | {sec_per_ep:.2f}s/ep | ETA {eta/60:.1f} min"
-            )
-
-        if do_validate and trn.early_stop_patience > 0 and stale_epochs >= trn.early_stop_patience:
-            print(f"Early stopping triggered at epoch {epoch}, best epoch = {best_epoch}")
-            break
+    if best_epoch <= 0:
+        best_state = copy.deepcopy(model.state_dict())
+        best_epoch = len(loss_hist)
+        best_val = val_select_hist[-1] if len(val_select_hist) > 0 else float("nan")
 
     model.load_state_dict(best_state)
-    print(f"Best validation epoch: {best_epoch} | Best validation loss: {best_val:.6f}")
+    final_epoch = len(loss_hist)
+    save_checkpoints(final_epoch, reason="training_complete", save_best=True, verbose=True)
 
-    save_checkpoint()
+    elapsed_total = time.time() - t0
+    print("Training summary:")
+    print(f"  Completed epochs this run: {max(0, final_epoch - completed_epochs)}")
+    print(f"  Total tracked epochs: {final_epoch} / {total_epochs}")
+    print(f"  Best validation epoch: {best_epoch}")
+    print(f"  Best validation score: {best_val:.6e}")
+    print(f"  Final train loss: {loss_hist[-1]:.6e}" if len(loss_hist) > 0 else "  Final train loss: n/a")
+    print(f"  Final val loss: {val_hist[-1]:.6e}" if len(val_hist) > 0 else "  Final val loss: n/a")
+    print(f"  Early stopping used: {'yes' if stopped_early else 'no'}")
+    print(f"  Runtime (this invocation): {elapsed_total/60:.2f} min")
+    print(f"  Checkpoints: best={best_ckpt_path.name}, last={last_ckpt_path.name}")
 
-    return model, best_epoch, best_val, loss_hist, pde_hist, bc_hist, val_hist, {
+    return model, best_epoch, best_val, loss_hist, pde_hist, energy_hist, bc_hist, val_hist, {
         "train_last": last_collocation_counts,
         "validation": val_collocation_counts,
-    }
+    }, last_boundary_points
 
 
 # -----------------------------
@@ -2002,14 +2782,14 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def main():
-    default_pretrain_epochs = env_int("KAN_PINN_PRETRAIN_EPOCHS", 1000)
-    default_pde_ramp_epochs = env_int("KAN_PINN_PDE_RAMP_EPOCHS", 3500)
+    default_pretrain_epochs = env_int("KAN_PINN_PRETRAIN_EPOCHS", 3000)
+    default_pde_ramp_epochs = env_int("KAN_PINN_PDE_RAMP_EPOCHS", 9000)
     default_model_select_start = default_pretrain_epochs + max(400, default_pde_ramp_epochs // 2)
     default_adaptive_start = default_pretrain_epochs + max(400, default_pde_ramp_epochs // 2)
 
     trn = TrainParams(
-        adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 8000)),
-        finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 8000),
+        adam_epochs=env_int("KAN_PINN_ADAM_EPOCHS", env_int("KAN_PINN_EPOCHS", 10000)),
+        finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 5000),
         pretrain_epochs=default_pretrain_epochs,
         pde_ramp_epochs=default_pde_ramp_epochs,
         n_interior_uniform=env_int("KAN_PINN_NU", 256),
@@ -2024,17 +2804,24 @@ def main():
         val_n_boundary_each=env_int("KAN_PINN_VAL_NB", 128),
         lambda_bc=env_float("KAN_PINN_LAMBDA_BC", 10.0),
         lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 0.5),
-        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 1.0),
-        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 0.02),
-        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 1.0),
-        learning_rate=env_float("KAN_PINN_LR", 3e-4),
-        finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 5e-5),
-        print_every=env_int("KAN_PINN_PRINT_EVERY", 50),
+        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 0.1),
+        lambda_energy=env_float("KAN_PINN_LAMBDA_ENERGY", 1.0),
+        lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 0.0),
+        lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 0.0),
+        learning_rate=env_float("KAN_PINN_LR", 5e-5),
+        finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 1e-5),
+        print_every=env_int("KAN_PINN_PRINT_EVERY", 10),
         validation_every=env_int("KAN_PINN_VAL_EVERY", 10),
         checkpoint_every=env_int("KAN_PINN_CHECKPOINT_EVERY", 50),
+        detailed_diag_every=env_int("KAN_PINN_DETAILED_DIAG_EVERY", 100),
         early_stop_patience=env_int("KAN_PINN_PATIENCE", 99999),
         min_improve=env_float("KAN_PINN_MIN_IMPROVE", 1e-5),
-        max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 1.0),
+        max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 0.25),
+        diagnostics_samples=env_int("KAN_PINN_DIAGNOSTIC_SAMPLES", 512),
+        pointwise_nx=env_int("KAN_PINN_POINTWISE_NX", 181),
+        pointwise_ny=env_int("KAN_PINN_POINTWISE_NY", 181),
+        pointwise_boundary_each=env_int("KAN_PINN_POINTWISE_BOUNDARY_EACH", 256),
+        pointwise_batch_size=env_int("KAN_PINN_POINTWISE_BATCH", 512),
         model_select_start_epoch=env_int("KAN_PINN_MODEL_SELECT_START_EPOCH", default_model_select_start),
         model_select_pde_weight_floor=env_float("KAN_PINN_MODEL_SELECT_PDE_FLOOR", 0.25),
         train_pde_chunk_size=env_int("KAN_PINN_TRAIN_PDE_CHUNK", 256),
@@ -2042,8 +2829,14 @@ def main():
         tip_weight_eps=env_float("KAN_PINN_TIP_WEIGHT_EPS", 2e-3),
         tip_weight_clip=env_float("KAN_PINN_TIP_WEIGHT_CLIP", 25.0),
         grad_norm_eps=env_float("KAN_PINN_GRAD_NORM_EPS", 1e-10),
-        initial_pde_weight=env_float("KAN_PINN_INITIAL_PDE_WEIGHT", 5e-3),
-        notch_face_bc_mode=os.getenv("KAN_PINN_G5_MODE", "natural").strip(),
+        initial_pde_weight=env_float("KAN_PINN_INITIAL_PDE_WEIGHT", 1e-6),
+        pde_loss_mode=os.getenv("KAN_PINN_PDE_LOSS_MODE", "pseudo_huber").strip(),
+        pde_residual_delta=env_float("KAN_PINN_PDE_RESIDUAL_DELTA", 25.0),
+        notch_face_bc_mode=os.getenv("KAN_PINN_G5_MODE", "dirichlet_zero").strip(),
+        hard_bc_mode=os.getenv("KAN_PINN_HARD_BC_MODE", "distance_all").strip(),
+        hard_bc_eps=env_float("KAN_PINN_HARD_BC_EPS", 1e-5),
+        hard_bc_distance_scale=env_float("KAN_PINN_HARD_BC_DISTANCE_SCALE", 0.25),
+        hard_bc_distance_power=env_float("KAN_PINN_HARD_BC_DISTANCE_POWER", 2.0),
         use_tip_enhanced_sampling=env_bool("KAN_PINN_USE_TIP_ENHANCED_SAMPLING", True),
         tip_strip_half_height=env_float("KAN_PINN_TIP_STRIP_HH", 0.02),
         tip_strip_length=env_float("KAN_PINN_TIP_STRIP_LEN", 0.12),
@@ -2055,6 +2848,15 @@ def main():
         tip_ratio_target=env_float("KAN_PINN_TIP_RATIO_TARGET", 1.2),
         tip_strip_bias_power=env_float("KAN_PINN_TIP_STRIP_BIAS_POWER", 2.5),
         tip_loss_r_weight_power=env_float("KAN_PINN_TIP_R_WEIGHT_POWER", 0.5),
+        lbfgs_epochs=env_int("KAN_PINN_LBFGS_EPOCHS", 0),
+        lbfgs_lr=env_float("KAN_PINN_LBFGS_LR", 0.8),
+        lbfgs_history_size=env_int("KAN_PINN_LBFGS_HISTORY", 25),
+        lbfgs_max_iter=env_int("KAN_PINN_LBFGS_MAX_ITER", 1),
+        lbfgs_n_uniform=env_int("KAN_PINN_LBFGS_NU", 128),
+        lbfgs_n_refine=env_int("KAN_PINN_LBFGS_NR", 128),
+        lbfgs_n_tip_strip=env_int("KAN_PINN_LBFGS_NTIP", 384),
+        lbfgs_n_tip_annulus=env_int("KAN_PINN_LBFGS_NANNULUS", 192),
+        lbfgs_n_boundary_each=env_int("KAN_PINN_LBFGS_NB", 96),
         adaptive_sampling=env_bool("KAN_PINN_ADAPTIVE_SAMPLING", False),
         adaptive_candidates=env_int("KAN_PINN_ADAPTIVE_CANDIDATES", 4096),
         adaptive_topk=env_int("KAN_PINN_ADAPTIVE_TOPK", 512),
@@ -2068,6 +2870,8 @@ def main():
         tip_ratio_near_dmax=env_float("KAN_PINN_TIP_RATIO_NEAR_DMAX", 5e-2),
         tip_ratio_far_dmin=env_float("KAN_PINN_TIP_RATIO_FAR_DMIN", 0.18),
         tip_ratio_far_dmax=env_float("KAN_PINN_TIP_RATIO_FAR_DMAX", 0.30),
+        hidden=env_int("KAN_PINN_HIDDEN", 96),
+        n_basis=env_int("KAN_PINN_N_BASIS", 48),
     )
 
     mat = MaterialParams(
@@ -2092,6 +2896,11 @@ def main():
         L=env_float("KAN_PINN_L", 1.0),
     )
 
+    trn.notch_face_bc_mode = canonical_g5_mode(trn.notch_face_bc_mode)
+    trn.hard_bc_mode = canonical_hard_bc_mode(trn.hard_bc_mode)
+    trn.pde_loss_mode = canonical_pde_loss_mode(trn.pde_loss_mode)
+    validate_configuration(mat, geo, trn)
+
     run_name = os.getenv("KAN_PINN_RUN_NAME", "").strip()
     resume_training = os.getenv("KAN_PINN_RESUME", "0").strip().lower() in ("1", "true", "yes", "y")
 
@@ -2100,27 +2909,68 @@ def main():
     torch.manual_seed(trn.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mpl_dir = Path("/tmp/mplconfig_kan_odes")
+    mpl_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_dir))
 
-    print("Starting training (Eq. 40 interior + Dirichlet Table-3 BCs on Γ1-Γ4).")
+    print("Starting training (Eq. 40 interior + Dirichlet BCs on Γ1-Γ5, with Γ5=0).")
     print(f"Device: {device}")
     print(f"Γ5 treatment: {boundary_roles(trn)['G5a']}")
+    print(f"Hard BC ansatz: {canonical_hard_bc_mode(trn.hard_bc_mode)}")
+    print(
+        f"PDE curriculum: lambda={trn.lambda_pde:g}, start_weight={trn.initial_pde_weight:g}, "
+        f"ramp={trn.pde_ramp_epochs}, loss={trn.pde_loss_mode}"
+    )
+    print(
+        f"Training phases: energy_pretrain={trn.pretrain_epochs}, "
+        f"adam={trn.adam_epochs}, finetune={trn.finetune_epochs}, lbfgs={trn.lbfgs_epochs}"
+    )
 
     model = KANPINN(hidden=trn.hidden, n_basis=trn.n_basis).to(device)
+    model.configure_boundary_ansatz(geo, bc, trn)
 
     root_outdir = Path(__file__).resolve().parent / "results_strainlimiting_python"
     outdir, selected_run = get_run_outdir(root_outdir, run_name if run_name else None)
     print(f"Run directory: {outdir}")
     print(f"Run ID: {selected_run}")
 
-    model, best_epoch, best_val, lhist, lpde_hist, lbc_hist, val_hist, collocation_counts = train_model(
+    model, best_epoch, best_val, lhist, lpde_hist, lenergy_hist, lbc_hist, val_hist, collocation_counts, train_boundary_points = train_model(
         model, mat, geo, bc, trn, outdir, device, resume=resume_training
     )
 
     final_bdata = sample_boundary_points(geo, trn.val_n_boundary_each)
     final_bdata_t = {k: to_tensor(v, device, requires_grad=False) for k, v in final_bdata.items()}
+    boundary_points_source = "last_training_epoch" if len(train_boundary_points) > 0 else "post_training_validation_sample"
+    boundary_points_to_save = train_boundary_points if len(train_boundary_points) > 0 else final_bdata
+    boundary_points_txt = save_boundary_points_text(
+        outdir,
+        boundary_points_to_save,
+        model,
+        bc,
+        trn,
+        device,
+        source=boundary_points_source,
+    )
+    print(f"Boundary datapoints saved in: {boundary_points_txt}")
     final_boundary_diag = boundary_diagnostics(model, final_bdata_t, bc, mat, geo, trn)
     verification = run_cross_verification(model, mat, geo, trn, device, boundary_diag=final_boundary_diag)
-    save_plots(model, mat, bc, lhist, lpde_hist, lbc_hist, val_hist, geo, trn, outdir, device, final_boundary_diag, collocation_counts, verification)
+    save_plots(
+        model,
+        mat,
+        bc,
+        lhist,
+        lpde_hist,
+        lenergy_hist,
+        lbc_hist,
+        val_hist,
+        geo,
+        trn,
+        outdir,
+        device,
+        final_boundary_diag,
+        collocation_counts,
+        verification,
+    )
 
     print(f"Training complete. Outputs saved in: {outdir}")
 
