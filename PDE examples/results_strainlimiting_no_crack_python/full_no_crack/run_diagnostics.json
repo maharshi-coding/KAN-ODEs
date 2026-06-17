@@ -1,0 +1,112 @@
+{
+  "problem": "no-crack full-square strain-limiting KAN-PINN",
+  "domain": "full square, no internal boundary",
+  "boundary_labels": [
+    "G1",
+    "G2",
+    "G3",
+    "G4"
+  ],
+  "training": {
+    "adam_epochs": 10000,
+    "finetune_epochs": 5000,
+    "lbfgs_epochs": 250,
+    "pretrain_epochs": 1500,
+    "pde_ramp_epochs": 5000,
+    "lambda_bc": 10.0,
+    "lambda_pde": 0.25,
+    "lambda_energy": 1.0,
+    "hard_bc_mode": "distance_outer",
+    "pde_loss_mode": "pseudo_huber",
+    "adaptive_sampling": true
+  },
+  "collocation_counts": {
+    "train_last": {
+      "uniform": 256,
+      "adaptive": 0,
+      "total": 256
+    },
+    "validation": {
+      "uniform": 1536,
+      "total": 1536
+    }
+  },
+  "material": {
+    "mu": 1.0,
+    "beta": 1.0,
+    "alpha": 0.2
+  },
+  "geometry": {
+    "xmin": 0.0,
+    "xmax": 1.0,
+    "ymin": 0.0,
+    "ymax": 1.0
+  },
+  "boundary_conditions": {
+    "sigma0": 1.0,
+    "L": 1.0
+  },
+  "boundary_diagnostics": {
+    "G1": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    },
+    "G2": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    },
+    "G3": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    },
+    "G4": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    }
+  },
+  "verification": {
+    "residual": {
+      "mean_abs": 0.058109935373067856,
+      "max_abs": 1.1925878524780273,
+      "rms": 0.0978374108672142
+    },
+    "finite": {
+      "total": 14641,
+      "bad": 0
+    },
+    "boundary": {
+      "G1": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      },
+      "G2": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      },
+      "G3": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      },
+      "G4": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      }
+    }
+  }
+}

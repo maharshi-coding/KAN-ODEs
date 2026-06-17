@@ -1,0 +1,154 @@
+{
+  "problem": "no-crack full-square strain-limiting adaptive grid-dependent PIKAN",
+  "basis_type": "grid-dependent RBF",
+  "dtype": "float64",
+  "legacy_poly_order": 5,
+  "initial_grid_size": 3,
+  "grid_extension_schedule": [
+    [
+      4000,
+      6
+    ],
+    [
+      9000,
+      10
+    ],
+    [
+      14000,
+      14
+    ],
+    [
+      18000,
+      18
+    ]
+  ],
+  "boundary_labels": [
+    "G1",
+    "G2",
+    "G3",
+    "G4"
+  ],
+  "training": {
+    "adam_epochs": 12000,
+    "finetune_epochs": 3000,
+    "lbfgs_epochs": 1500,
+    "pretrain_epochs": 0,
+    "pde_ramp_epochs": 3000,
+    "lambda_bc": 10.0,
+    "lambda_pde": 1.0,
+    "lambda_energy": 0.0,
+    "hard_bc_mode": "coons_outer",
+    "pde_loss_mode": "mse",
+    "pde_residual_scale": 0.05,
+    "adaptive_sampling": true,
+    "residual_based_sampling": true,
+    "adaptive_fraction": 1.0,
+    "rad_a": 2.0,
+    "rad_c": 0.25,
+    "rba_eta": 0.001,
+    "grid_adaptation": true,
+    "grid_adapt_every": 500,
+    "grid_epsilon": 0.05,
+    "optimizer_state_transition": true,
+    "lr_after_grid_extension": 0.15,
+    "zero_correction_init": false
+  },
+  "collocation_counts": {
+    "train_last": {
+      "uniform": 2048,
+      "adaptive": 2048,
+      "total": 4096
+    },
+    "validation": {
+      "uniform": 1536,
+      "total": 1536
+    }
+  },
+  "material": {
+    "mu": 1.0,
+    "beta": 1.0,
+    "alpha": 1.5
+  },
+  "geometry": {
+    "xmin": 0.0,
+    "xmax": 1.0,
+    "ymin": 0.0,
+    "ymax": 1.0
+  },
+  "boundary_conditions": {
+    "sigma0": 1.0,
+    "L": 1.0
+  },
+  "boundary_diagnostics": {
+    "G1": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    },
+    "G2": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    },
+    "G3": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    },
+    "G4": {
+      "count": 128,
+      "loss": 0.0,
+      "mean_abs_error": 0.0,
+      "max_abs_error": 0.0
+    }
+  },
+  "verification": {
+    "residual": {
+      "mean_abs": 0.03091607470127798,
+      "max_abs": 0.24887621028642795,
+      "rms": 0.0425977198874852
+    },
+    "finite": {
+      "total": 14641,
+      "bad": 0
+    },
+    "boundary": {
+      "G1": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      },
+      "G2": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      },
+      "G3": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      },
+      "G4": {
+        "count": 128,
+        "loss": 0.0,
+        "mean_abs_error": 0.0,
+        "max_abs_error": 0.0
+      }
+    }
+  },
+  "loss_summary": {
+    "final_total_loss": 0.2395760026339233,
+    "final_pde_loss": 0.2395760026339233,
+    "final_validation_loss": 0.25110595846353095,
+    "final_boundary_loss": 0.0,
+    "pde_residual_mean_abs": 0.03091607470127798,
+    "pde_residual_rms": 0.0425977198874852,
+    "pde_residual_max_abs": 0.24887621028642795
+  }
+}
