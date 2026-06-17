@@ -3,11 +3,15 @@
 """
 KAN-PINN (PyTorch) for the strain-limiting PDE (Equation 40):
 
-div( ∇Φ / [ 2μ (1 + β |∇Φ|^α)^(1/α) ] ) = 0
+-div( ∇Φ / [ 2μ (1 + β |∇Φ|^α)^(1/α) ] ) = 0,
+Φ = g on ∂Ω.
+
+For the V-notch example, Table 3 in the paper gives
+Γ1: σ0 L, Γ2: 0, Γ3: -σ0(x - L), Γ4: σ0(L - x), Γ5: 0.
 
 Features implemented per task:
 - Exact PDE residual via autograd (no finite differences)
-- Notched geometry sampling (rectangle minus V-notch void)
+- Figure 3 V-notch geometry: unit square, tip at (0.5, 0.5), notch opens to Γ2
 - Dirichlet BCs on Γ1-Γ5 with Γ5=0 on both notch faces
 - Optional distance-function hard Dirichlet ansatz
 - Nonlinear energy pretraining followed by strong-residual training
@@ -75,7 +79,8 @@ class GeometryParams:
     ymin: float = 0.0
     ymax: float = 1.0
     tip: Tuple[float, float] = (0.5, 0.5)
-    notch_angle_deg: float = 20.0
+    notch_angle_deg: float = 30.0
+    # Horizontal notch depth from the tip to the right-side mouth.
     notch_length: float = 0.50
     refine_half_width: float = 0.10
 
@@ -94,25 +99,25 @@ class BCParams:
 class TrainParams:
     adam_epochs: int = 10000
     finetune_epochs: int = 5000
-    pretrain_epochs: int = 3000
-    pde_ramp_epochs: int = 9000
+    pretrain_epochs: int = 1500
+    pde_ramp_epochs: int = 5000
 
-    n_interior_uniform: int = 256
-    n_interior_refine: int = 256
-    n_interior_tip_strip: int = 1536
-    n_interior_tip_annulus: int = 768
+    n_interior_uniform: int = 1024
+    n_interior_refine: int = 512
+    n_interior_tip_strip: int = 1024
+    n_interior_tip_annulus: int = 512
     n_boundary_each: int = 128
 
-    val_n_interior_uniform: int = 256
-    val_n_interior_refine: int = 256
-    val_n_interior_tip_strip: int = 2048
-    val_n_interior_tip_annulus: int = 1024
+    val_n_interior_uniform: int = 1024
+    val_n_interior_refine: int = 512
+    val_n_interior_tip_strip: int = 1024
+    val_n_interior_tip_annulus: int = 512
     val_n_boundary_each: int = 128
 
     lambda_bc: float = 10.0
-    lambda_gauge: float = 0.01
+    lambda_gauge: float = 0.0
     lambda_sym: float = 0.5
-    lambda_pde: float = 0.1
+    lambda_pde: float = 0.25
     lambda_energy: float = 1.0
     lambda_tip: float = 0.0
     lambda_tip_ratio: float = 0.0
@@ -123,8 +128,8 @@ class TrainParams:
     tip_strip_bias_power: float = 2.5
     tip_loss_r_weight_power: float = 0.5
 
-    learning_rate: float = 5e-5
-    finetune_lr: float = 1e-5
+    learning_rate: float = 1e-4
+    finetune_lr: float = 2e-5
 
     print_every: int = 10
     validation_every: int = 10
@@ -132,7 +137,7 @@ class TrainParams:
     detailed_diag_every: int = 100
     early_stop_patience: int = 99999
     min_improve: float = 1e-5
-    max_grad_norm: float = 0.25
+    max_grad_norm: float = 1.0
     diagnostics_samples: int = 512
     pointwise_nx: int = 181
     pointwise_ny: int = 181
@@ -150,10 +155,11 @@ class TrainParams:
     initial_pde_weight: float = 1e-6
     pde_loss_mode: str = "pseudo_huber"
     pde_residual_delta: float = 25.0
+    pde_mse_blend: float = 0.02
     notch_face_bc_mode: str = "dirichlet_zero"
     hard_bc_mode: str = "distance_all"
     hard_bc_eps: float = 1e-5
-    hard_bc_distance_scale: float = 0.25
+    hard_bc_distance_scale: float = 0.08
     hard_bc_distance_power: float = 2.0
     use_tip_enhanced_sampling: bool = True
 
@@ -169,8 +175,8 @@ class TrainParams:
     lr_gamma_finetune: float = 0.9999
 
     # L-BFGS polishing after Adam stages
-    lbfgs_epochs: int = 0
-    lbfgs_lr: float = 0.8
+    lbfgs_epochs: int = 250
+    lbfgs_lr: float = 0.5
     lbfgs_history_size: int = 25
     lbfgs_max_iter: int = 1
     lbfgs_n_uniform: int = 128
@@ -184,10 +190,11 @@ class TrainParams:
     val_pde_chunk_size: int = 256
 
     # Adaptive residual sampling
-    adaptive_sampling: bool = False
+    adaptive_sampling: bool = True
     adaptive_candidates: int = 4096
-    adaptive_topk: int = 512
+    adaptive_topk: int = 768
     adaptive_start_epoch: int = 2750
+    adaptive_refresh_every: int = 25
 
     # Reproducibility
     seed: int = 42
@@ -197,7 +204,7 @@ class TrainParams:
     n_basis: int = 48
 
     # PDE tip weighting control (0 = plain MSE, no singular weighting)
-    tip_weight_power: float = 1.0
+    tip_weight_power: float = 0.5
     reference_line_tip_offset: float = 2e-3
     tip_ratio_n_near: int = 128
     tip_ratio_n_far: int = 128
@@ -212,7 +219,14 @@ class TrainParams:
 # -----------------------------
 
 class KANLayer(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, n_basis: int, scale: float = 0.1):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_basis: int,
+        scale: float = 0.1,
+        center_range: Tuple[float, float] = (0.0, 1.0),
+    ):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -222,7 +236,7 @@ class KANLayer(nn.Module):
         self.lin = nn.Parameter(scale * torch.randn(out_dim, in_dim))
         self.bias = nn.Parameter(torch.zeros(out_dim))
 
-        centers = torch.linspace(0.0, 1.0, n_basis)
+        centers = torch.linspace(float(center_range[0]), float(center_range[1]), n_basis)
         self.centers = nn.Parameter(centers)
         self.logwidth = nn.Parameter(torch.full((n_basis,), math.log(0.15)))
 
@@ -240,10 +254,10 @@ class KANLayer(nn.Module):
 class KANPINN(nn.Module):
     def __init__(self, hidden: int = 96, n_basis: int = 48):
         super().__init__()
-        self.k1 = KANLayer(2, hidden, n_basis)
-        self.k2 = KANLayer(hidden, hidden, n_basis)
-        self.k3 = KANLayer(hidden, hidden, n_basis)
-        self.k4 = KANLayer(hidden, 1, n_basis)
+        self.k1 = KANLayer(2, hidden, n_basis, center_range=(0.0, 1.0))
+        self.k2 = KANLayer(hidden, hidden, n_basis, center_range=(-1.0, 1.0))
+        self.k3 = KANLayer(hidden, hidden, n_basis, center_range=(-1.0, 1.0))
+        self.k4 = KANLayer(hidden, 1, n_basis, center_range=(-1.0, 1.0))
         self.hard_bc_mode = "none"
         self.hard_bc_eps = 1e-12
         self.hard_bc_distance_scale = 0.15
@@ -299,8 +313,12 @@ def notch_face_directions(geo: GeometryParams) -> Tuple[np.ndarray, np.ndarray]:
 def notch_mouth_points(geo: GeometryParams) -> Tuple[np.ndarray, np.ndarray]:
     x0, y0 = geo.tip
     d_upper, d_lower = notch_face_directions(geo)
-    pu = np.array([x0, y0], dtype=np.float32) + geo.notch_length * d_upper
-    pl = np.array([x0, y0], dtype=np.float32) + geo.notch_length * d_lower
+    # geo.notch_length is the axial/horizontal depth shown in Figure 3.
+    # Convert it to the slanted face length so the notch mouth lies at
+    # x = tip_x + notch_length, i.e. on Γ2 for the default unit square.
+    face_len = geo.notch_length / max(math.cos(geo.notch_angle / 2.0), 1e-12)
+    pu = np.array([x0, y0], dtype=np.float32) + face_len * d_upper
+    pl = np.array([x0, y0], dtype=np.float32) + face_len * d_lower
     return pu, pl
 
 
@@ -389,8 +407,15 @@ def validate_configuration(mat: MaterialParams, geo: GeometryParams, trn: TrainP
         raise ValueError(f"Invalid notch tip={geo.tip}; tip must lie inside domain bounds.")
     if geo.notch_length <= 0.0:
         raise ValueError(f"Invalid notch_length={geo.notch_length}. Must be > 0.")
-    if not (0.0 < geo.notch_angle_deg < 180.0):
-        raise ValueError(f"Invalid notch_angle_deg={geo.notch_angle_deg}. Must be in (0, 180).")
+    expected_notch_length = geo.xmax - tip_x
+    if not math.isclose(geo.notch_length, expected_notch_length, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(
+            "This Figure 3 V-notch domain expects KAN_PINN_NOTCH_LENGTH to be the "
+            f"horizontal distance from tip to Γ2: xmax - tip_x = {expected_notch_length}. "
+            f"Got {geo.notch_length}."
+        )
+    if not (0.0 <= geo.notch_angle_deg < 180.0):
+        raise ValueError(f"Invalid notch_angle_deg={geo.notch_angle_deg}. Must be in [0, 180).")
 
     if trn.adam_epochs < 0 or trn.finetune_epochs < 0:
         raise ValueError("Training epochs must be non-negative.")
@@ -414,8 +439,12 @@ def validate_configuration(mat: MaterialParams, geo: GeometryParams, trn: TrainP
         raise ValueError("KAN_PINN_HARD_BC_DISTANCE_POWER must be > 0.")
     if trn.pde_residual_delta <= 0.0:
         raise ValueError("KAN_PINN_PDE_RESIDUAL_DELTA must be > 0.")
+    if trn.pde_mse_blend < 0.0:
+        raise ValueError("KAN_PINN_PDE_MSE_BLEND must be >= 0.")
     if trn.lbfgs_epochs < 0:
         raise ValueError("KAN_PINN_LBFGS_EPOCHS must be >= 0.")
+    if trn.adaptive_refresh_every <= 0:
+        raise ValueError("KAN_PINN_ADAPTIVE_REFRESH_EVERY must be > 0.")
 
 
 def sample_points_excluding_notch(
@@ -628,7 +657,8 @@ def sample_tip_ratio_line_points(
 def notch_face_points(geo: GeometryParams, n: int) -> Tuple[np.ndarray, np.ndarray]:
     x0, y0 = geo.tip
     d1, d2 = notch_face_directions(geo)
-    s = np.random.rand(n).astype(np.float32) * np.float32(geo.notch_length)
+    face_len = geo.notch_length / max(math.cos(geo.notch_angle / 2.0), 1e-12)
+    s = np.random.rand(n).astype(np.float32) * np.float32(face_len)
 
     p1 = np.stack([x0 + s * d1[0], y0 + s * d1[1]], axis=1).astype(np.float32)
     p2 = np.stack([x0 + s * d2[0], y0 + s * d2[1]], axis=1).astype(np.float32)
@@ -722,7 +752,8 @@ def torch_segment_distance(xy: torch.Tensor, a: Tuple[float, float], b: Tuple[fl
     t = torch.sum((xy - a_t.view(1, 2)) * v.view(1, 2), dim=1) / denom
     t = torch.clamp(t, 0.0, 1.0)
     closest = a_t.view(1, 2) + t.view(-1, 1) * v.view(1, 2)
-    return safe_l2_norm(xy - closest, eps)
+    dist2 = torch.sum((xy - closest) ** 2, dim=1)
+    return torch.sqrt(dist2 + eps * eps) - eps
 
 
 def hard_boundary_distances(
@@ -795,7 +826,15 @@ def hard_boundary_ansatz(
     inv_nearest = torch.sum(1.0 / (d_pos + eps), dim=1)
     nearest = 1.0 / inv_nearest.clamp_min(eps)
     vanish = nearest / (nearest + distance_scale)
-    return extension + vanish * raw_phi
+    soft_phi = extension + vanish * raw_phi
+
+    on_boundary = d_pos <= eps
+    boundary_count = torch.sum(on_boundary.to(dtype=xy.dtype), dim=1)
+    boundary_target = (
+        torch.sum(on_boundary.to(dtype=xy.dtype) * target_stack, dim=1)
+        / boundary_count.clamp_min(1.0)
+    )
+    return torch.where(boundary_count > 0.0, boundary_target, soft_phi)
 
 
 def compute_stress(
@@ -831,7 +870,7 @@ def pde_residual(
 ) -> torch.Tensor:
     """
     Residual for Eq. 40:
-      div( grad(phi) / (2*mu*(1+beta*|grad(phi)|^alpha)^(1/alpha)) )
+      -div( grad(phi) / (2*mu*(1+beta*|grad(phi)|^alpha)^(1/alpha)) )
     """
     if not xy.requires_grad:
         xy = xy.clone().detach().requires_grad_(True)
@@ -849,22 +888,26 @@ def pde_residual(
 
     qx = q[:, 0]
     qy = q[:, 1]
-    dqx_dx = torch.autograd.grad(
-        qx,
-        xy,
-        grad_outputs=torch.ones_like(qx),
-        create_graph=create_graph,
-        retain_graph=True,
-    )[0][:, 0]
-    dqy_dy = torch.autograd.grad(
-        qy,
-        xy,
-        grad_outputs=torch.ones_like(qy),
-        create_graph=create_graph,
-        retain_graph=create_graph,
-    )[0][:, 1]
 
-    return dqx_dx + dqy_dy
+    def partial_derivative(values: torch.Tensor, coord: int, retain_graph: bool) -> torch.Tensor:
+        if not values.requires_grad:
+            return torch.zeros_like(xy[:, coord])
+        grad = torch.autograd.grad(
+            values,
+            xy,
+            grad_outputs=torch.ones_like(values),
+            create_graph=create_graph,
+            retain_graph=retain_graph,
+            allow_unused=True,
+        )[0]
+        if grad is None:
+            return torch.zeros_like(xy[:, coord])
+        return grad[:, coord]
+
+    dqx_dx = partial_derivative(qx, 0, retain_graph=True)
+    dqy_dy = partial_derivative(qy, 1, retain_graph=create_graph)
+
+    return -(dqx_dx + dqy_dy)
 
 
 def dirichlet_target(label: str, xy: torch.Tensor, bc: BCParams, trn: TrainParams) -> torch.Tensor:
@@ -900,7 +943,10 @@ def pde_residual_objective(weighted_residual: torch.Tensor, trn: TrainParams) ->
         device=weighted_residual.device,
     )
     scaled = weighted_residual / delta
-    return 2.0 * delta * delta * (torch.sqrt(1.0 + scaled * scaled) - 1.0)
+    objective = 2.0 * delta * delta * (torch.sqrt(1.0 + scaled * scaled) - 1.0)
+    if trn.pde_mse_blend > 0.0:
+        objective = objective + trn.pde_mse_blend * weighted_residual ** 2
+    return objective
 
 
 def weighted_pde_loss(
@@ -1789,6 +1835,7 @@ def save_run_diagnostics(
             "lambda_bc": trn.lambda_bc,
             "lambda_pde": trn.lambda_pde,
             "lambda_energy": trn.lambda_energy,
+            "lambda_gauge": trn.lambda_gauge,
             "lambda_tip": trn.lambda_tip,
             "lambda_tip_ratio": trn.lambda_tip_ratio,
             "hard_bc_mode": trn.hard_bc_mode,
@@ -1800,10 +1847,12 @@ def save_run_diagnostics(
             "initial_pde_weight": trn.initial_pde_weight,
             "pde_loss_mode": trn.pde_loss_mode,
             "pde_residual_delta": trn.pde_residual_delta,
+            "pde_mse_blend": trn.pde_mse_blend,
             "model_select_start_epoch": trn.model_select_start_epoch,
             "model_select_pde_weight_floor": trn.model_select_pde_weight_floor,
             "adaptive_sampling": trn.adaptive_sampling,
             "adaptive_start_epoch": trn.adaptive_start_epoch,
+            "adaptive_refresh_every": trn.adaptive_refresh_every,
             "tip_ratio_n_near": trn.tip_ratio_n_near,
             "tip_ratio_n_far": trn.tip_ratio_n_far,
             "tip_ratio_near_dmin": trn.tip_ratio_near_dmin,
@@ -2022,17 +2071,11 @@ def save_plots(
 
     # Loss history
     plt.figure(figsize=(8, 5))
-    plt.plot(loss_hist, lw=2, label="L total")
-    plt.plot(pde_hist, lw=2, label="L_pde")
-    if len(energy_hist) > 0:
-        plt.plot(energy_hist, lw=2, label="L_energy")
-    plt.plot(bc_hist, lw=2, label="L_bc")
-    if len(val_hist) > 0:
-        plt.plot(val_hist, lw=2, label="L_val")
+    plt.plot(loss_hist, lw=2, label="L_total")
     plt.yscale("log")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training history")
+    plt.ylabel("L_total")
+    plt.title("L_total")
     plt.legend()
     plt.tight_layout()
     plt.savefig(outdir / "loss_history.png", dpi=160)
@@ -2340,6 +2383,10 @@ def train_model(
             f"lr_start={current_lr(optimizer):.3e}"
         )
 
+        adaptive_cache = np.empty((0, 2), dtype=np.float32)
+        adaptive_cache_epoch = -10**9
+        adaptive_refresh_every = max(1, int(trn.adaptive_refresh_every))
+
         for epoch in range(start_epoch, end_epoch + 1):
             model.train()
             interior, collocation_counts = sample_interior_points(geo, trn)
@@ -2351,7 +2398,14 @@ def train_model(
                 try:
                     n_adapt = min(trn.adaptive_topk, max(0, interior.shape[0] // 4))
                     if n_adapt > 0:
-                        adapt_pts = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
+                        should_refresh = (
+                            adaptive_cache.shape[0] == 0
+                            or epoch - adaptive_cache_epoch >= adaptive_refresh_every
+                        )
+                        if should_refresh:
+                            adaptive_cache = adaptive_residual_points(model, geo, mat, trn, device, n_adapt)
+                            adaptive_cache_epoch = epoch
+                        adapt_pts = adaptive_cache
                         if adapt_pts.size > 0:
                             interior = np.vstack([interior, adapt_pts]).astype(np.float32)
                             collocation_counts["adaptive"] = int(adapt_pts.shape[0])
@@ -2373,7 +2427,8 @@ def train_model(
             lg = gauge_loss(model, device)
             lsym = symmetry_loss(model, geo, device)
             base_loss = trn.lambda_bc * lbc + trn.lambda_gauge * lg + trn.lambda_sym * lsym
-            base_loss.backward()
+            if base_loss.requires_grad:
+                base_loss.backward()
 
             ltip_f = 0.0
             lratio_f = 0.0
@@ -2782,8 +2837,8 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def main():
-    default_pretrain_epochs = env_int("KAN_PINN_PRETRAIN_EPOCHS", 3000)
-    default_pde_ramp_epochs = env_int("KAN_PINN_PDE_RAMP_EPOCHS", 9000)
+    default_pretrain_epochs = env_int("KAN_PINN_PRETRAIN_EPOCHS", 1500)
+    default_pde_ramp_epochs = env_int("KAN_PINN_PDE_RAMP_EPOCHS", 5000)
     default_model_select_start = default_pretrain_epochs + max(400, default_pde_ramp_epochs // 2)
     default_adaptive_start = default_pretrain_epochs + max(400, default_pde_ramp_epochs // 2)
 
@@ -2792,31 +2847,32 @@ def main():
         finetune_epochs=env_int("KAN_PINN_FINETUNE_EPOCHS", 5000),
         pretrain_epochs=default_pretrain_epochs,
         pde_ramp_epochs=default_pde_ramp_epochs,
-        n_interior_uniform=env_int("KAN_PINN_NU", 256),
-        n_interior_refine=env_int("KAN_PINN_NR", 256),
-        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 1536),
-        n_interior_tip_annulus=env_int("KAN_PINN_NANNULUS", 768),
+        n_interior_uniform=env_int("KAN_PINN_NU", 1024),
+        n_interior_refine=env_int("KAN_PINN_NR", 512),
+        n_interior_tip_strip=env_int("KAN_PINN_NTIP", 1024),
+        n_interior_tip_annulus=env_int("KAN_PINN_NANNULUS", 512),
         n_boundary_each=env_int("KAN_PINN_NB", 128),
-        val_n_interior_uniform=env_int("KAN_PINN_VAL_NU", 256),
-        val_n_interior_refine=env_int("KAN_PINN_VAL_NR", 256),
-        val_n_interior_tip_strip=env_int("KAN_PINN_VAL_NTIP", 2048),
-        val_n_interior_tip_annulus=env_int("KAN_PINN_VAL_NANNULUS", 1024),
+        val_n_interior_uniform=env_int("KAN_PINN_VAL_NU", 1024),
+        val_n_interior_refine=env_int("KAN_PINN_VAL_NR", 512),
+        val_n_interior_tip_strip=env_int("KAN_PINN_VAL_NTIP", 1024),
+        val_n_interior_tip_annulus=env_int("KAN_PINN_VAL_NANNULUS", 512),
         val_n_boundary_each=env_int("KAN_PINN_VAL_NB", 128),
         lambda_bc=env_float("KAN_PINN_LAMBDA_BC", 10.0),
+        lambda_gauge=env_float("KAN_PINN_LAMBDA_GAUGE", 0.0),
         lambda_sym=env_float("KAN_PINN_LAMBDA_SYM", 0.5),
-        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 0.1),
+        lambda_pde=env_float("KAN_PINN_LAMBDA_PDE", 0.25),
         lambda_energy=env_float("KAN_PINN_LAMBDA_ENERGY", 1.0),
         lambda_tip=env_float("KAN_PINN_LAMBDA_TIP", 0.0),
         lambda_tip_ratio=env_float("KAN_PINN_LAMBDA_TIP_RATIO", 0.0),
-        learning_rate=env_float("KAN_PINN_LR", 5e-5),
-        finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 1e-5),
+        learning_rate=env_float("KAN_PINN_LR", 1e-4),
+        finetune_lr=env_float("KAN_PINN_FINETUNE_LR", 2e-5),
         print_every=env_int("KAN_PINN_PRINT_EVERY", 10),
         validation_every=env_int("KAN_PINN_VAL_EVERY", 10),
         checkpoint_every=env_int("KAN_PINN_CHECKPOINT_EVERY", 50),
         detailed_diag_every=env_int("KAN_PINN_DETAILED_DIAG_EVERY", 100),
         early_stop_patience=env_int("KAN_PINN_PATIENCE", 99999),
         min_improve=env_float("KAN_PINN_MIN_IMPROVE", 1e-5),
-        max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 0.25),
+        max_grad_norm=env_float("KAN_PINN_MAX_GRAD_NORM", 1.0),
         diagnostics_samples=env_int("KAN_PINN_DIAGNOSTIC_SAMPLES", 512),
         pointwise_nx=env_int("KAN_PINN_POINTWISE_NX", 181),
         pointwise_ny=env_int("KAN_PINN_POINTWISE_NY", 181),
@@ -2832,10 +2888,11 @@ def main():
         initial_pde_weight=env_float("KAN_PINN_INITIAL_PDE_WEIGHT", 1e-6),
         pde_loss_mode=os.getenv("KAN_PINN_PDE_LOSS_MODE", "pseudo_huber").strip(),
         pde_residual_delta=env_float("KAN_PINN_PDE_RESIDUAL_DELTA", 25.0),
+        pde_mse_blend=env_float("KAN_PINN_PDE_MSE_BLEND", 0.02),
         notch_face_bc_mode=os.getenv("KAN_PINN_G5_MODE", "dirichlet_zero").strip(),
         hard_bc_mode=os.getenv("KAN_PINN_HARD_BC_MODE", "distance_all").strip(),
         hard_bc_eps=env_float("KAN_PINN_HARD_BC_EPS", 1e-5),
-        hard_bc_distance_scale=env_float("KAN_PINN_HARD_BC_DISTANCE_SCALE", 0.25),
+        hard_bc_distance_scale=env_float("KAN_PINN_HARD_BC_DISTANCE_SCALE", 0.08),
         hard_bc_distance_power=env_float("KAN_PINN_HARD_BC_DISTANCE_POWER", 2.0),
         use_tip_enhanced_sampling=env_bool("KAN_PINN_USE_TIP_ENHANCED_SAMPLING", True),
         tip_strip_half_height=env_float("KAN_PINN_TIP_STRIP_HH", 0.02),
@@ -2848,8 +2905,8 @@ def main():
         tip_ratio_target=env_float("KAN_PINN_TIP_RATIO_TARGET", 1.2),
         tip_strip_bias_power=env_float("KAN_PINN_TIP_STRIP_BIAS_POWER", 2.5),
         tip_loss_r_weight_power=env_float("KAN_PINN_TIP_R_WEIGHT_POWER", 0.5),
-        lbfgs_epochs=env_int("KAN_PINN_LBFGS_EPOCHS", 0),
-        lbfgs_lr=env_float("KAN_PINN_LBFGS_LR", 0.8),
+        lbfgs_epochs=env_int("KAN_PINN_LBFGS_EPOCHS", 250),
+        lbfgs_lr=env_float("KAN_PINN_LBFGS_LR", 0.5),
         lbfgs_history_size=env_int("KAN_PINN_LBFGS_HISTORY", 25),
         lbfgs_max_iter=env_int("KAN_PINN_LBFGS_MAX_ITER", 1),
         lbfgs_n_uniform=env_int("KAN_PINN_LBFGS_NU", 128),
@@ -2857,12 +2914,13 @@ def main():
         lbfgs_n_tip_strip=env_int("KAN_PINN_LBFGS_NTIP", 384),
         lbfgs_n_tip_annulus=env_int("KAN_PINN_LBFGS_NANNULUS", 192),
         lbfgs_n_boundary_each=env_int("KAN_PINN_LBFGS_NB", 96),
-        adaptive_sampling=env_bool("KAN_PINN_ADAPTIVE_SAMPLING", False),
+        adaptive_sampling=env_bool("KAN_PINN_ADAPTIVE_SAMPLING", True),
         adaptive_candidates=env_int("KAN_PINN_ADAPTIVE_CANDIDATES", 4096),
-        adaptive_topk=env_int("KAN_PINN_ADAPTIVE_TOPK", 512),
+        adaptive_topk=env_int("KAN_PINN_ADAPTIVE_TOPK", 768),
         adaptive_start_epoch=env_int("KAN_PINN_ADAPTIVE_START_EPOCH", default_adaptive_start),
+        adaptive_refresh_every=env_int("KAN_PINN_ADAPTIVE_REFRESH_EVERY", 25),
         seed=env_int("KAN_PINN_SEED", 42),
-        tip_weight_power=env_float("KAN_PINN_TIP_WEIGHT_POWER", 1.0),
+        tip_weight_power=env_float("KAN_PINN_TIP_WEIGHT_POWER", 0.5),
         reference_line_tip_offset=env_float("KAN_PINN_REFERENCE_LINE_TIP_OFFSET", 2e-3),
         tip_ratio_n_near=env_int("KAN_PINN_TIP_RATIO_N_NEAR", 128),
         tip_ratio_n_far=env_int("KAN_PINN_TIP_RATIO_N_FAR", 128),
@@ -2886,7 +2944,7 @@ def main():
         ymin=env_float("KAN_PINN_YMIN", 0.0),
         ymax=env_float("KAN_PINN_YMAX", 1.0),
         tip=(env_float("KAN_PINN_TIP_X", 0.5), env_float("KAN_PINN_TIP_Y", 0.5)),
-        notch_angle_deg=env_float("KAN_PINN_NOTCH_ANGLE_DEG", 20.0),
+        notch_angle_deg=env_float("KAN_PINN_NOTCH_ANGLE_DEG", 30.0),
         notch_length=env_float("KAN_PINN_NOTCH_LENGTH", 0.50),
         refine_half_width=env_float("KAN_PINN_REFINE_HALF_WIDTH", 0.10),
     )
@@ -2913,13 +2971,25 @@ def main():
     mpl_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(mpl_dir))
 
-    print("Starting training (Eq. 40 interior + Dirichlet BCs on Γ1-Γ5, with Γ5=0).")
+    print("Starting training (Eq. 40 interior + Table 3 Dirichlet BCs on Γ1-Γ5, with Γ5=0).")
     print(f"Device: {device}")
+    pu, pl = notch_mouth_points(geo)
+    print(
+        f"Domain: [{geo.xmin:g},{geo.xmax:g}]x[{geo.ymin:g},{geo.ymax:g}], "
+        f"tip={geo.tip}, θ={geo.notch_angle_deg:g}°, "
+        f"Γ5 mouth=({float(pu[0]):.6g},{float(pu[1]):.6g})/"
+        f"({float(pl[0]):.6g},{float(pl[1]):.6g})"
+    )
     print(f"Γ5 treatment: {boundary_roles(trn)['G5a']}")
     print(f"Hard BC ansatz: {canonical_hard_bc_mode(trn.hard_bc_mode)}")
     print(
         f"PDE curriculum: lambda={trn.lambda_pde:g}, start_weight={trn.initial_pde_weight:g}, "
-        f"ramp={trn.pde_ramp_epochs}, loss={trn.pde_loss_mode}"
+        f"ramp={trn.pde_ramp_epochs}, loss={trn.pde_loss_mode}, mse_blend={trn.pde_mse_blend:g}"
+    )
+    print(
+        f"Sampling: NU={trn.n_interior_uniform}, NR={trn.n_interior_refine}, "
+        f"NTIP={trn.n_interior_tip_strip}, NANN={trn.n_interior_tip_annulus}, "
+        f"adaptive={'on' if trn.adaptive_sampling else 'off'}"
     )
     print(
         f"Training phases: energy_pretrain={trn.pretrain_epochs}, "

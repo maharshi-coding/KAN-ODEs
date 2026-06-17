@@ -51,6 +51,12 @@ PDE examples/results_strainlimiting/
 
 PDE examples/results_strainlimiting_python/
 
+PDE examples/results_strainlimiting_no_crack_python/
+
+PDE examples/results_strainlimiting_no_crack_polynomial_python/
+
+PDE examples/adaptive_optimizer_experiments/results_adaptive_optimizer_runs/
+
 PDE examples/train_log.txt
 
 .venv/
